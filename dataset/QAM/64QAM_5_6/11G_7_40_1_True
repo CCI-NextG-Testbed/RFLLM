@@ -1,0 +1,10 @@
+{
+    "standard": "11g",
+    "bandwidth_mhz": 40,
+    "mcs": "64QAM-5/6",
+    "payload_bytes": 64,
+    "num_frames": 1,
+    "guard_interval": "GI400",
+    "ifg_us": 1000,
+    "description": "Simple 64QAM 11g Signal at 40MHz with FEC 5/6"
+}
