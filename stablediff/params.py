@@ -26,8 +26,8 @@ params_wifi = AttrDict(
     data_dir=['./dataset/wifi/raw'],
     out_dir='./dataset/wifi/output/prediction.mat',
     cond_dir=['./dataset/wifi/prompt'],
-    #fid_pred_dir = './dataset/wifi/img_matric/pred',
-    #fid_data_dir = './dataset/wifi/img_matric/data',
+    fid_pred_dir = './dataset/wifi/img_matric/pred',
+    fid_data_dir = './dataset/wifi/img_matric/data',
     # Training params
     max_iter=None, # Unlimited number of iterations.
     batch_size=1,

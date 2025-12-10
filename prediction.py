@@ -85,7 +85,7 @@ def main(args):
 if __name__ == '__main__':
     parser = ArgumentParser(
         description='runs inference (generation) process based on trained tfdiff model')
-    parser.add_argument('--task_id', type=int,
+    parser.add_argument('--task_id', type=int, default=0,
                         help='use case of tfdiff model, 0/1/2/3 for WiFi/FMCW/MIMO/EEG respectively')
     parser.add_argument('--prompt', type=str, required=True,
                         help="prompt to give to diffusion model to evaluate"  )
