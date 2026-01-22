@@ -225,3 +225,146 @@ class tfdiff_WiFi(nn.Module):
             x = block(x, c)
         x = self.final_layer(x, c)
         return x
+    
+class tfdiff_Simple(nn.Module):
+    """
+    A simpler variant of tfdiff_WiFi for generic complex-valued sequences.
+
+    Expected tensor shapes:
+      x: [B, N, input_dim, 2]        (complex stored as (..., 2) = (real, imag))
+      t: [B] or [B,] int/float step  (same as your DiffusionEmbedding usage)
+      cond (optional):
+         - None: uses only diffusion embedding t
+         - tensor [B, cond_dim] real: projected into complex [B, H, 2]
+         - tensor [B, H, 2] complex: used directly as conditioning
+    Output:
+      y: [B, N, output_dim, 2]
+    """
+
+    def __init__(self, params):
+        super().__init__()
+        self.params = params
+        self.device = torch.device("cpu")
+
+        self.input_dim = params.input_dim
+        self.output_dim = getattr(params, "output_dim", params.input_dim)
+        self.hidden_dim = params.hidden_dim
+        self.num_heads = params.num_heads
+        self.dropout = params.dropout
+        self.mlp_ratio = params.mlp_ratio
+
+        # Embeddings
+        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim)
+        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim)
+
+        # Optional conditioning projection (real -> complex hidden)
+        self.text_encoder = SentenceTransformer("thenlper/gte-large")
+        text_dim = self.text_encoder.get_sentence_embedding_dimension()
+        # project real text embedding to complex [B, H, 2]
+        self.text_proj = nn.Linear(text_dim, self.hidden_dim * 2)
+        init_weight_xavier(self.text_proj)
+
+        self.bits_token = nn.Linear(1, self.hidden_dim * 2)
+        init_weight_xavier(self.bits_token)
+
+        # Blocks + head
+        self.blocks = nn.ModuleList(
+            [DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(params.num_block)]
+        )
+        self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
+
+    def _encode_text(self, prompts, device):
+        """
+        prompts: list[str] or already a tensor
+        Returns: complex conditioning vector [B, H, 2]
+        """
+        if isinstance(prompts, (list, tuple)):
+            # SentenceTransformer handles batching internally
+            text_emb = self.text_encoder.encode(
+                prompts,
+                convert_to_tensor=True,
+                device=device,
+                show_progress_bar=False,
+            )   # [B, D_text], real
+        elif isinstance(prompts, torch.Tensor):
+            # assume already [B, D_text] real embeddings
+            text_emb = prompts.to(device)
+        else:
+            # single string
+            text_emb = self.text_encoder.encode(
+                [prompts],
+                convert_to_tensor=True,
+                device=device,
+                show_progress_bar=False,
+            )   # [1, D_text]
+
+        B = text_emb.shape[0]
+        # project to 2*hidden_dim and reshape to complex [B, H, 2]
+        text_proj = self.text_proj(text_emb)              # [B, 2H]
+        text_proj = text_proj.view(B, self.hidden_dim, 2) # [B, H, 2]
+        return text_proj
+    
+    def _encode_bits_seq(self, bits, device, N):
+        """
+        bits: [B,N] 0/1 (or [B,N,1])
+        return: [B,N,H,2]
+        """
+        if bits is None:
+            return None
+        if not isinstance(bits, torch.Tensor):
+            bits = torch.tensor(bits, dtype=torch.float32, device=device)
+        else:
+            bits = bits.to(device).float()
+
+        if bits.ndim == 1:
+            bits = bits.unsqueeze(0)  # [1,N]
+        if bits.shape[1] != N:
+            # If mismatch, you need a mapping from samples->symbols (oversampling etc.)
+            # For now, truncate/pad as a safe fallback:
+            if bits.shape[1] > N:
+                bits = bits[:, :N]
+            else:
+                pad = torch.zeros(bits.shape[0], N - bits.shape[1], device=device)
+                bits = torch.cat([bits, pad], dim=1)
+
+        bits = bits.unsqueeze(-1)  # [B,N,1]
+        B = bits.shape[0]
+        b = self.bits_token(bits)              # [B,N,2H]
+        b = b.view(B, N, self.hidden_dim, 2)   # [B,N,H,2]
+        return b
+
+    def forward(self, x, t, cond):
+        device = x.device
+
+        # cond is dict: {'prompt': label/list[str], 'bits': [B,N]}
+        prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
+        bits_input   = cond.get("bits") if isinstance(cond, dict) else None
+
+        # x expected [B,N,1,2]
+        B, N = x.shape[0], x.shape[1]
+
+        # tokenize signal
+        x = self.p_embed(x)        # [B,N,H,2]
+
+        # timestep embedding
+        t = self.t_embed(t)        # [B,H,2]
+
+        # prompt is global "c" like your reference
+        c_prompt = self._encode_text(prompt_input, device)  # [B,H,2]
+        if c_prompt is None:
+            c = t
+        else:
+            if c_prompt.shape[0] == 1 and B > 1:
+                c_prompt = c_prompt.expand(B, -1, -1)
+            c = t + c_prompt       # [B,H,2]
+
+        # bits are per-token injection (unambiguous)
+        b_seq = self._encode_bits_seq(bits_input, device, N)  # [B,N,H,2] or None
+        if b_seq is not None:
+            x = x + b_seq
+
+        for block in self.blocks:
+            x = block(x, c)
+
+        x = self.final_layer(x, c)
+        return x

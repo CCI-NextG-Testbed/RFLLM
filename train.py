@@ -7,9 +7,10 @@ from torch.nn.parallel import DistributedDataParallel
 
 from argparse import ArgumentParser
 
-from stablediff.params import params_wifi
+from stablediff.params import all_params
 from stablediff.learner import tfdiffLearner
-from stablediff.wifi_model import tfdiff_WiFi
+from stablediff.models import tfdiff_WiFi
+from stablediff.models import tfdiff_Simple
 from stablediff.dataset import from_path
 
 def _get_free_port():
@@ -27,7 +28,11 @@ def _train_impl(replica_id, model, dataset, params):
 
 def train(params):
     dataset = from_path(params)
-    model = tfdiff_WiFi(params)
+    device = torch.device('cpu', 0)
+    if params.task_id == 0:
+        model = tfdiff_WiFi(params).to(device)
+    elif params.task_id == 1:
+        model = tfdiff_Simple(params).to(device)
     _train_impl(0, model, dataset, params)
 
 
@@ -41,14 +46,16 @@ def train_distributed(replica_id, replica_count, port, params):
     torch.cuda.set_device(device)
     if params.task_id == 0:
         model = tfdiff_WiFi(params).to(device)
-    else:    
+    elif params.task_id == 1:
+        model = tfdiff_Simple(params).to(device)
+    else:
         raise ValueError("Unexpected task_id.")
     model = DistributedDataParallel(model, device_ids=[replica_id])
     _train_impl(replica_id, model, dataset, params)
 
 
 def main(args):
-    params = params_wifi
+    params = all_params[args.task_id]
     if args.batch_size is not None:
         params.batch_size = args.batch_size
     if args.model_dir is not None:

@@ -84,6 +84,12 @@ class SignalDiffusion(nn.Module):
 
     def degrade_fn(self, x_0, t, task_id):
         device = x_0.device
+        # --- ensure schedules are on same device as data ---
+        if hasattr(self, "noise_weights") and self.noise_weights.device != device:
+            self.noise_weights = self.noise_weights.to(device)
+        if hasattr(self, "info_weights") and self.info_weights.device != device:
+            self.info_weights = self.info_weights.to(device)
+
         if task_id in [0, 1]:
             noise_weight = self.noise_weights[t, :].unsqueeze(-1).unsqueeze(-1).to(device) # equivalent gaussian noise weights, [B, N, 1, 1, 1]
             info_weight = self.info_weights[t, :].unsqueeze(-1).unsqueeze(-1).to(device) # equivalent original info weights, [B, N, 1, 1, 1]
@@ -104,17 +110,29 @@ class SignalDiffusion(nn.Module):
         - returns x_0_hat with shape [B, N, F, 2], matching training.
         """
         # ----- batch size from cond -----
-        if isinstance(cond, str):
-            cond_list = [cond]
-        elif isinstance(cond, (list, tuple)):
-            cond_list = list(cond)
+        # cond may be either:
+        #  - str or list[str] (legacy)
+        #  - dict with keys {'prompt': str|list[str], 'bits': array|tensor}
+        if isinstance(cond, dict):
+            cond_list = cond.get('prompt')
+            if isinstance(cond_list, str):
+                cond_list = [cond_list]
+            elif isinstance(cond_list, (list, tuple)):
+                cond_list = list(cond_list)
+            else:
+                raise TypeError("cond['prompt'] must be str or list[str].")
         else:
-            raise TypeError("For WiFi prompt-only generation, cond must be str or list[str].")
+            if isinstance(cond, str):
+                cond_list = [cond]
+            elif isinstance(cond, (list, tuple)):
+                cond_list = list(cond)
+            else:
+                raise TypeError("For WiFi prompt-only generation, cond must be str or list[str] or dict with 'prompt'.")
 
         batch_size = len(cond_list)
 
         # WiFi task (task_id == 0): x has shape [B, N, F, 2]
-        if self.task_id != 0:
+        if self.task_id != 0 and self.task_id != 1:
             raise ValueError("sampling() prompt-only path is currently implemented for task_id == 0 (WiFi).")
 
         N = self.N   # e.g., 512
@@ -135,8 +153,9 @@ class SignalDiffusion(nn.Module):
         # 3) Reverse diffusion: s = T-1 ... 0
         for s in range(self.max_step - 1, -1, -1):
             t = s * torch.ones(batch_size, dtype=torch.int64, device=device)
-            # model(x_s, t, cond_list)  -- cond_list is list[str], same as training
-            x_0_hat = restore_fn(x_s, t, cond_list)
+            # call model/restore_fn. If original cond was a dict (contains bits), pass that
+            call_cond = cond if isinstance(cond, dict) else cond_list
+            x_0_hat = restore_fn(x_s, t, call_cond)
 
             if s > 0:
                 t_prev = (s - 1) * torch.ones(batch_size, dtype=torch.int64, device=device)
@@ -161,7 +180,7 @@ class SignalDiffusion(nn.Module):
         x_s = inf_weight * noise # [B, N, S, A, 2]
         # Restore data from noise.
         for s in range(self.max_step-1, -1, -1): # reverse from t to 0
-            x_0_hat = restore_fn(x_s, s*torch.ones(batch_size, dtype=torch.int64), cond) # resotre \hat{x_0} from x_s using trained tfdiff model
+            x_0_hat = restore_fn(x_s, s*torch.ones(batch_size, dtype=torch.int64), cond) # restore \hat{x_0} from x_s using trained tfdiff model
             if s > 0:
                 # x_{s-1} = x_s - D(\hat{x_0}, s) + D(\hat{x_0}, s-1)
                 x_s = x_s - self.degrade_fn(x_0_hat, t=s*torch.ones(batch_size, dtype=torch.int64),task_id = self.task_id) + self.degrade_fn(x_0_hat, t=(s-1)*torch.ones(batch_size, dtype=torch.int64),task_id = self.task_id) # degrade \hat{x_0} to x_{s-1}
