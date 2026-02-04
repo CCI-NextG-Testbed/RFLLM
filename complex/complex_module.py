@@ -280,6 +280,63 @@ class ComplexDotProductAttention(nn.Module):
         Y = complex_bmm(self.dropout(self.attention_weights), values)
         return Y
 
+class LinearComplexAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout=0.0, bias=True, eps=1e-6):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.eps = eps
+
+        self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_v = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_o = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+
+        self.drop = ComplexDropout(dropout) if dropout and dropout > 0 else nn.Identity()
+
+    @staticmethod
+    def _phi(x):
+        """
+        Positive feature map phi(x): apply ELU+1 to real and imag separately.
+        x: [..., 2]
+        """
+        xr, xi = [t.squeeze(-1) for t in torch.split(x, 1, dim=-1)]
+        return torch.stack((F.elu(xr) + 1.0, F.elu(xi) + 1.0), dim=-1)
+
+    def forward(self, q, k, v):
+        # Project
+        q = self.w_q(q)  # [B,N,H,2]
+        k = self.w_k(k)
+        v = self.w_v(v)
+
+        qh = transpose_qkv(q, self.num_heads)
+        kh = transpose_qkv(k, self.num_heads)
+        vh = transpose_qkv(v, self.num_heads)
+
+        qf = self._phi(qh) 
+        kf = self._phi(kh)  
+
+        kf_T = kf.transpose(1, 2).contiguous()
+        KV = complex_bmm(kf_T, vh)  # [Bh, D, D,2]
+
+        # out = qf @ KV: [Bh, N, D,2]
+        out = complex_bmm(qf, KV)
+
+        ones = torch.zeros_like(vh)
+        ones[..., 0] = 1.0
+        K1 = complex_bmm(kf_T, ones)      # [Bh, D, D,2]
+        denom_c = complex_bmm(qf, K1)     # [Bh, N, D,2]
+
+        denom = denom_c[..., 0].clamp(min=self.eps)  # [Bh,N,D]
+        out = out / denom.unsqueeze(-1)              # broadcast over complex dim
+
+        out = self.drop(out)
+
+        out = transpose_output(out, self.num_heads)
+        out = self.w_o(out)
+        return out
+
 
 class ComplexMultiHeadAttention(nn.Module):
     def __init__(
@@ -311,6 +368,80 @@ class ComplexMultiHeadAttention(nn.Module):
         output_concat = transpose_output(output, self.num_heads)
         Y = self.w_o(output_concat)
         return Y
+    
+class CosineDotProductAttention(nn.Module):
+    """
+    Cosine attention using REAL-part cosine similarity for scores,
+    then complex_bmm to apply weights to complex values.
+
+    queries/keys/values: [B*heads, N, D, 2]
+    returns:            [B*heads, N, D, 2]
+    """
+    def __init__(self, dropout=0.0, eps=1e-8):
+        super().__init__()
+        self.dropout_p = dropout
+        self.eps = eps
+
+    def forward(self, queries, keys, values):
+        # Use real parts for score computation (stable baseline)
+        q_r = queries[..., 0]  # [Bh, Nq, D]
+        k_r = keys[..., 0]     # [Bh, Nk, D]
+
+        # L2 normalize along feature dim D
+        qn = q_r / (q_r.norm(dim=-1, keepdim=True) + self.eps)
+        kn = k_r / (k_r.norm(dim=-1, keepdim=True) + self.eps)
+
+        # scores: [Bh, Nq, Nk]
+        scores = torch.bmm(qn, kn.transpose(1, 2))
+
+        # softmax over keys
+        attn = F.softmax(scores, dim=-1)
+
+        # dropout on attention weights (real)
+        if self.training and self.dropout_p and self.dropout_p > 0:
+            attn = F.dropout(attn, p=self.dropout_p)
+
+        # Convert to complex weights: real=attn, imag=0 so we can use complex_bmm
+        attn_c = torch.zeros(attn.shape[0], attn.shape[1], attn.shape[2], 2,
+                             device=attn.device, dtype=values.dtype)
+        attn_c[..., 0] = attn
+
+        # apply weights to complex values
+        out = complex_bmm(attn_c, values)  # [Bh, Nq, D, 2]
+        return out
+
+
+class CosineComplexMultiHeadAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout=0.0, bias=True, eps=1e-8):
+        super().__init__()
+        self.num_heads = num_heads
+
+        self.attn = CosineDotProductAttention(dropout=dropout, eps=eps)
+
+        self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_v = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+        self.w_o = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
+
+    def forward(self, queries, keys, values):
+        # Project
+        q = self.w_q(queries)
+        k = self.w_k(keys)
+        v = self.w_v(values)
+
+        # Head split: [B,N,H,2] -> [B*heads, N, head_dim, 2]
+        q = transpose_qkv(q, self.num_heads)
+        k = transpose_qkv(k, self.num_heads)
+        v = transpose_qkv(v, self.num_heads)
+
+        # Cosine attention per head
+        out = self.attn(q, k, v)  # [B*heads, N, head_dim, 2]
+
+        # Merge heads: -> [B,N,H,2]
+        out = transpose_output(out, self.num_heads)
+        out = self.w_o(out)
+        return out
+
 
 
 class ComplexPositionalEncoding(nn.Module):
