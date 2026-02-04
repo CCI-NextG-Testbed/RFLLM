@@ -5,8 +5,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import csv
 from stablediff.diffusion import SignalDiffusion, GaussianDiffusion
 from stablediff.dataset import _nested_map
+
+def _init_csv(csv_path="training_log.csv"):
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch",
+                "mean_loss",
+                "lr",
+                "attn_type",
+            ])
+
+def _append_epoch_csv(epoch, mean_loss, lr, csv_path="training_log.csv", attn_type="ComplexMultiheadAttention"):
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            epoch,
+            mean_loss,
+            lr,
+            attn_type,
+        ])
+
 
 class IQPlusBitsLoss(nn.Module):
     def __init__(self, fft_weight=1.0, bits_weight=0.05):
@@ -120,7 +143,7 @@ class tfdiffLearner:
 
     def train(self, max_iter=None):
         device = next(self.model.parameters()).device
-
+        _init_csv()
         while True:  # epoch
             epoch_loss_sum = 0.0        # <<< NEW
             epoch_loss_count = 0        # <<< NEW
@@ -168,18 +191,26 @@ class tfdiffLearner:
             else:
                 epoch_loss_mean = float("nan")
 
+            
             if self.is_master:
-                tqdm.write(
-                    f"\n=== Epoch {epoch_idx} complete === "
-                    f"mean_loss={epoch_loss_mean:.6f} over {epoch_loss_count} iters\n"
+                lr = self.optimizer.param_groups[0].get("lr", float("nan"))
+
+                # ---- CSV logging ----
+                _append_epoch_csv(
+                    epoch=epoch_idx,
+                    mean_loss=epoch_loss_mean,
+                    lr=lr
                 )
 
-                # ---- TensorBoard epoch loss ----
-                writer = self.summary_writer or SummaryWriter(self.log_dir, purge_step=self.iter)
-                writer.add_scalar("train/epoch_loss", epoch_loss_mean, epoch_idx)
-                writer.flush()
-                self.summary_writer = writer
+                # ---- checkpoint once per epoch ----
+                self.save_to_checkpoint()
 
+                tqdm.write(
+                    f"\n=== Epoch {epoch_idx} complete === "
+                    f"mean_loss={epoch_loss_mean:.6f}\n"
+                )
+
+            # ---- scheduler step ----
             self.lr_scheduler.step(epoch_loss_mean)
 
     def train_iter(self, features):

@@ -3,6 +3,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+def rms_norm(x, target_rms=1.0, eps=1e-8):
+    # x: [B, N, F, 2] float
+    cur_rms = torch.sqrt(torch.mean(x**2, dim=(1,2,3), keepdim=True) + eps)  # [B,1,1,1]
+    return x * (target_rms / cur_rms)
+
 class SignalDiffusion(nn.Module):
     def __init__(self, params):
         super().__init__()
@@ -161,6 +166,7 @@ class SignalDiffusion(nn.Module):
                 t_prev = (s - 1) * torch.ones(batch_size, dtype=torch.int64, device=device)
                 x_s = self.degrade_fn(x_0_hat, t_prev, self.task_id)
 
+        x_0_hat = rms_norm(x_0_hat, target_rms=1.0)
         return x_0_hat
     
     def robust_sampling(self, restore_fn, cond, device):
