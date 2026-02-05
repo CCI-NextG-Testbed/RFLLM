@@ -97,8 +97,8 @@ class DiA(nn.Module):
         super().__init__()
         self.norm1 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
-        self.attn = cm.ComplexMultiHeadAttention(
-            hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
+        self.attn = cm.CosineComplexMultiHeadAttention(
+            hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
         self.norm2 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
@@ -151,79 +151,6 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
         x = self.linear(x)
-        return x
-
-class tfdiff_WiFi(nn.Module):
-    def __init__(self, params):
-        super().__init__()
-        self.params = params
-        self.device = torch.device('cpu')
-        self.learn_tfdiff = params.learn_tfdiff
-        self.input_dim = params.input_dim
-        self.output_dim = self.input_dim
-        self.hidden_dim = params.hidden_dim
-        self.num_heads = params.num_heads
-        self.dropout = params.dropout
-        self.task_id = params.task_id
-        self.mlp_ratio = params.mlp_ratio
-        self.p_embed = PositionEmbedding(
-            params.sample_rate, params.input_dim, params.hidden_dim)
-        self.t_embed = DiffusionEmbedding(
-            params.max_step, params.embed_dim, params.hidden_dim)
-        
-         # -------- TEXT CONDITIONING (GTE-LARGE) --------
-        self.text_encoder = SentenceTransformer("BAAI/bge-large-en-v1.5")
-        text_dim = self.text_encoder.get_sentence_embedding_dimension()
-        # project real text embedding to complex [B, H, 2]
-        self.text_proj = nn.Linear(text_dim, self.hidden_dim * 2)
-        init_weight_xavier(self.text_proj)
-
-        self.blocks = nn.ModuleList([
-            DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(params.num_block)
-        ])
-        self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
-
-    def _encode_text(self, prompts, device):
-        """
-        prompts: list[str] or already a tensor
-        Returns: complex conditioning vector [B, H, 2]
-        """
-        if isinstance(prompts, (list, tuple)):
-            # SentenceTransformer handles batching internally
-            text_emb = self.text_encoder.encode(
-                prompts,
-                convert_to_tensor=True,
-                device=device,
-                show_progress_bar=False,
-            )   # [B, D_text], real
-        elif isinstance(prompts, torch.Tensor):
-            # assume already [B, D_text] real embeddings
-            text_emb = prompts.to(device)
-        else:
-            # single string
-            text_emb = self.text_encoder.encode(
-                [prompts],
-                convert_to_tensor=True,
-                device=device,
-                show_progress_bar=False,
-            )   # [1, D_text]
-
-        B = text_emb.shape[0]
-        # project to 2*hidden_dim and reshape to complex [B, H, 2]
-        text_proj = self.text_proj(text_emb)              # [B, 2H]
-        text_proj = text_proj.view(B, self.hidden_dim, 2) # [B, H, 2]
-        return text_proj
-
-
-    def forward(self, x, t, l):
-        device = x.device
-        x = self.p_embed(x)
-        t = self.t_embed(t)
-        text_cond = self._encode_text(l, device)
-        c = text_cond + t
-        for block in self.blocks:
-            x = block(x, c)
-        x = self.final_layer(x, c)
         return x
     
 class tfdiff_Simple(nn.Module):

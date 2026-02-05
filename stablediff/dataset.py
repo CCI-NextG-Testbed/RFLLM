@@ -27,36 +27,6 @@ def _nested_map(struct, map_fn):
     return map_fn(struct)
 
 
-class WiFiDataset(torch.utils.data.Dataset):
-    def __init__(self, paths):
-        super().__init__()
-        self.filenames = []
-        for path in paths:
-            self.filenames += glob(f'{path}/**/*.mat', recursive=True)
-
-    def __len__(self):
-        return len(self.filenames)
-
-    def __getitem__(self, idx):
-        cur_filename = self.filenames[idx]
-        cur_sample = scio.loadmat(cur_filename,verify_compressed_data_integrity=False)
-        # Ensure required keys exist
-        if 'data' not in cur_sample:
-            raise KeyError(f"Missing required key 'data' in file {cur_filename}")
-        if 'label' not in cur_sample:
-            raise KeyError(f"Missing required key 'label' in file {cur_filename}")
-        if 'bits' not in cur_sample:
-            raise KeyError(f"Missing required key 'bits' in file {cur_filename}")
-
-        cur_data = torch.from_numpy(cur_sample['data']).to(torch.complex64)
-        bits = cur_sample['bits']
-
-        return {
-            'data': cur_data,
-            'label': cur_sample['label'],    # textual prompt or label
-            'bits': bits                    # required: numpy array or similar
-        }
-
 class SimpleSignalDataset(torch.utils.data.Dataset):
     """
     Expects each .mat file to contain:
@@ -256,13 +226,9 @@ class Collator:
 
 def from_path(params, is_distributed=False):
     data_dir = params.data_dir
-    task_id = params.task_id
-    if task_id == 0:
-        dataset = WiFiDataset(data_dir)
-    elif task_id == 1:
-        dataset = SimpleSignalDataset(data_dir)
-    else:
-        raise ValueError("Unexpected task_id.")
+ 
+    dataset = SimpleSignalDataset(data_dir)
+
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=params.batch_size,
@@ -277,13 +243,9 @@ def from_path(params, is_distributed=False):
 
 def from_path_inference(params):
     cond_dir = params.cond_dir
-    task_id = params.task_id
-    if task_id == 0:
-        dataset = WiFiDataset(cond_dir)
-    elif task_id == 1:
-        dataset = SimpleSignalDataset(cond_dir)
-    else:
-        raise ValueError("Unexpected task_id.")
+ 
+    dataset = SimpleSignalDataset(cond_dir)
+  
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=params.inference_batch_size,

@@ -7,7 +7,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from argparse import ArgumentParser
 
-from stablediff.params import all_params
+from stablediff.params import params_simple
 from stablediff.learner import tfdiffLearner
 from stablediff.models import tfdiff_WiFi
 from stablediff.models import tfdiff_Simple
@@ -29,10 +29,7 @@ def _train_impl(replica_id, model, dataset, params):
 def train(params):
     dataset = from_path(params)
     device = torch.device('cpu', 0)
-    if params.task_id == 0:
-        model = tfdiff_WiFi(params).to(device)
-    elif params.task_id == 1:
-        model = tfdiff_Simple(params).to(device)
+    model = tfdiff_Simple(params).to(device)
     _train_impl(0, model, dataset, params)
 
 
@@ -44,18 +41,13 @@ def train_distributed(replica_id, replica_count, port, params):
     dataset = from_path(params, is_distributed=True)
     device = torch.device('cuda', replica_id)
     torch.cuda.set_device(device)
-    if params.task_id == 0:
-        model = tfdiff_WiFi(params).to(device)
-    elif params.task_id == 1:
-        model = tfdiff_Simple(params).to(device)
-    else:
-        raise ValueError("Unexpected task_id.")
+    model = tfdiff_Simple(params).to(device)
     model = DistributedDataParallel(model, device_ids=[replica_id])
     _train_impl(replica_id, model, dataset, params)
 
 
 def main(args):
-    params = all_params[args.task_id]
+    params = params_simple
     if args.batch_size is not None:
         params.batch_size = args.batch_size
     if args.model_dir is not None:
@@ -78,13 +70,11 @@ def main(args):
         train(params)
 
 
-# python train.py --task_id [task_id] --model_dir [model_dir] --data_dir [data_dir]
-# HF_ENV_NAME=py38-202207 hfai python train.py --task_id [task_id] --model_dir [model_dir] --data_dir [data_dir] --max_iter [iter_num] --batch_size [batch_size] -- -n [node_num] --force
+# python train.py  --model_dir [model_dir] --data_dir [data_dir]
+# HF_ENV_NAME=py38-202207 hfai python train.py --model_dir [model_dir] --data_dir [data_dir] --max_iter [iter_num] --batch_size [batch_size] -- -n [node_num] --force
 if __name__ == '__main__':
     parser = ArgumentParser(
         description='train (or resume training) a tfdiff model')
-    parser.add_argument('--task_id', type=int,
-                        help='use case of tfdiff model, 0/1/2/3 for WiFi/FMCW/MIMO/EEG respectively')
     parser.add_argument('--model_dir', default=None,
                         help='directory in which to store model checkpoints and training logs')
     parser.add_argument('--data_dir', default=None, nargs='+',

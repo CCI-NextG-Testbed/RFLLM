@@ -119,7 +119,7 @@ def main():
     plt.xlim(min(xmins), args.xmax)
     plt.ylim(args.ymin, args.ymax)
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    plt.title("BER vs SNR (Multiple Runs)")
+    plt.title("BER vs SNR (E5-Large Attention Block Study)")
     plt.legend()
 
     if args.out:

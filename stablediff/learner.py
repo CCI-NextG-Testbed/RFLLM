@@ -76,22 +76,12 @@ class tfdiffLearner:
     def __init__(self, log_dir, model_dir, model, dataset, optimizer, params, *args, **kwargs):
         os.makedirs(model_dir, exist_ok=True)
         self.model_dir = model_dir
-        self.task_id = params.task_id
         self.log_dir = log_dir
         self.model = model
         self.dataset = dataset
         self.optimizer = optimizer
         self.device = model.device
         self.diffusion = SignalDiffusion(params) if params.signal_diffusion else GaussianDiffusion(params)
-        # self.prof = torch.profiler.profile(
-        #     schedule=torch.profiler.schedule(skip_first=1, wait=0, warmup=2, active=1, repeat=1),
-        #     on_trace_ready=torch.profiler.tensorboard_trace_handler(self.log_dir),
-        #     with_modules=True, with_flops=True
-        # )
-        # eeg
-        # self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
-        #     self.optimizer, 5, gamma=0.5)
-        # mimo
         self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
         )
@@ -222,15 +212,12 @@ class tfdiffLearner:
         B = data.shape[0]
         t = torch.randint(0, self.diffusion.max_step, [B], dtype=torch.int64, device=data.device)
 
-        degrade_data = self.diffusion.degrade_fn(data, t, self.task_id)
+        degrade_data = self.diffusion.degrade_fn(data, t)
 
         # model must accept prompts as list[str] and embed them internally
         # pass conditioning as a dict to support both prompt (text) and bits
         cond = {'prompt': prompts, 'bits': bits}
         predicted = self.model(degrade_data, t, cond)
-
-        if self.task_id == 3:
-            data = data.reshape(-1, 512, 1, 2)
 
         loss = self.loss_fn(data, predicted, bits=bits)
         loss.backward()

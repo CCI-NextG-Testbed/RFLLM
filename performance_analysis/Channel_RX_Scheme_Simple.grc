@@ -1,0 +1,484 @@
+options:
+  parameters:
+    author: ''
+    catch_exceptions: 'True'
+    category: '[GRC Hier Blocks]'
+    cmake_opt: ''
+    comment: ''
+    copyright: ''
+    description: ''
+    gen_cmake: 'On'
+    gen_linking: dynamic
+    generate_options: qt_gui
+    hier_block_src_path: '.:'
+    id: Channel_RX_Scheme_Simple
+    max_nouts: '0'
+    output_language: python
+    placement: (0,0)
+    qt_qss_theme: ''
+    realtime_scheduling: ''
+    run: 'True'
+    run_command: '{python} -u {filename}'
+    run_options: prompt
+    sizing_mode: fixed
+    thread_safe_setters: ''
+    title: Not titled yet
+    window_size: (1000,1000)
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [8, 8]
+    rotation: 0
+    state: enabled
+
+blocks:
+- name: amp
+  id: variable
+  parameters:
+    comment: ''
+    value: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [552, 16.0]
+    rotation: 0
+    state: enabled
+- name: noise_voltage
+  id: variable
+  parameters:
+    comment: ''
+    value: ((amp*amp) / (2*10**(snr_db_range/10)))
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [296, 16.0]
+    rotation: 0
+    state: enabled
+- name: samp_rate
+  id: variable
+  parameters:
+    comment: ''
+    value: 2e6
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [184, 12]
+    rotation: 0
+    state: enabled
+- name: snr_db_range
+  id: variable
+  parameters:
+    comment: ''
+    value: '-20'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [424, 16.0]
+    rotation: 0
+    state: enabled
+- name: analog_agc_xx_0
+  id: analog_agc_xx
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    gain: '1.0'
+    max_gain: '65536'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    rate: 1e-3
+    reference: '1.0'
+    type: complex
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [648, 288.0]
+    rotation: 0
+    state: enabled
+- name: blocks_file_source_0
+  id: blocks_file_source
+  parameters:
+    affinity: ''
+    alias: ''
+    begin_tag: pmt.PMT_NIL
+    comment: ''
+    file: /home/rapcole12/Documents/RFLLM/dataset/simple/pred6.bin
+    length: '0'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    repeat: 'True'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [48, 176.0]
+    rotation: 0
+    state: enabled
+- name: blocks_file_source_1
+  id: blocks_file_source
+  parameters:
+    affinity: ''
+    alias: ''
+    begin_tag: pmt.PMT_NIL
+    comment: ''
+    file: /home/rapcole12/Documents/RFLLM/dataset/simple/pred_bits6.bin
+    length: '0'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    offset: '0'
+    repeat: 'True'
+    type: byte
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [824, 184.0]
+    rotation: 0
+    state: enabled
+- name: blocks_message_strobe_0
+  id: blocks_message_strobe
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    msg: pmt.intern("tick")
+    period: '7000'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [48, 432.0]
+    rotation: 0
+    state: enabled
+- name: blocks_msgpair_to_var_0
+  id: blocks_msgpair_to_var
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    target: snr_db_range
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [520, 440.0]
+    rotation: 0
+    state: enabled
+- name: blocks_throttle2_0
+  id: blocks_throttle2
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    ignoretag: 'True'
+    limit: auto
+    maximum: '0.1'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samples_per_second: samp_rate
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [272, 200.0]
+    rotation: 0
+    state: enabled
+- name: channels_channel_model_0
+  id: channels_channel_model
+  parameters:
+    affinity: ''
+    alias: ''
+    block_tags: 'False'
+    comment: ''
+    epsilon: '1.0'
+    freq_offset: '0.0'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    noise_voltage: noise_voltage**0.5
+    seed: '0'
+    taps: '1.0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [448, 168.0]
+    rotation: 0
+    state: enabled
+- name: digital_constellation_decoder_cb_0
+  id: digital_constellation_decoder_cb
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: ''
+    constellation: digital.constellation_bpsk()
+    maxoutbuf: '0'
+    minoutbuf: '0'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [856, 312.0]
+    rotation: 0
+    state: enabled
+- name: epy_block_0
+  id: epy_block
+  parameters:
+    _source_code: "import numpy as np\nfrom gnuradio import gr\nimport os\nimport\
+      \ csv\nimport time\n\n\nclass blk(gr.sync_block):\n    \"\"\"\n    Bitstream\
+      \ BER + alignment estimator + CSV logger (SNR, BER).\n\n    Inputs:\n      in0:\
+      \ TX bits (uchar 0/1)\n      in1: RX bits (uchar 0/1)\n\n    Outputs:\n    \
+      \  none\n\n    Each update appends TWO values to CSV: snr_db, ber\n    Logging\
+      \ happens every log_period seconds (default: 1.0s).\n    \"\"\"\n\n    def __init__(self,\n\
+      \                 window_len=4096,\n                 max_lag=2000,\n\n     \
+      \            csv_path=\"ber_log.csv\",\n                 append=True,\n    \
+      \             write_header=True,\n                 snr_db=0.0,\n\n         \
+      \        log_period=1.0   # <-- NEW: seconds between CSV writes\n          \
+      \       ):\n\n        gr.sync_block.__init__(\n            self,\n         \
+      \   name=\"ber_and_sync_csv\",\n            in_sig=[np.uint8, np.uint8],\n \
+      \           out_sig=[]\n        )\n\n        self.window_len = int(window_len)\n\
+      \        self.max_lag = int(max_lag)\n        self.snr_db = float(snr_db)\n\n\
+      \        self.log_period = float(log_period)\n        self._last_log_time =\
+      \ time.time()\n\n        # CSV config\n        self.csv_path = str(csv_path)\n\
+      \        self.append = bool(append)\n        self.write_header = bool(write_header)\n\
+      \n        # Keep enough history to evaluate +/- lags\n        self.keep = self.window_len\
+      \ + 2 * self.max_lag + 1024\n\n        self.tx_hist = np.zeros((0,), dtype=np.uint8)\n\
+      \        self.rx_hist = np.zeros((0,), dtype=np.uint8)\n\n        self.cur_ber\
+      \ = np.float32(1.0)\n        self.cur_lag = np.float32(0.0)\n\n        # Prepare\
+      \ CSV file\n        mode = \"a\" if self.append else \"w\"\n        file_exists\
+      \ = os.path.exists(self.csv_path)\n\n        self._csv_file = open(self.csv_path,\
+      \ mode, newline=\"\")\n        self._csv_writer = csv.writer(self._csv_file)\n\
+      \n        if self.write_header and (not file_exists or not self.append):\n \
+      \           self._csv_writer.writerow([\"snr_db\", \"ber\"])\n            self._csv_file.flush()\n\
+      \n    def _append_hist(self, hist, x):\n        if hist.size == 0:\n       \
+      \     hist = x.copy()\n        else:\n            hist = np.concatenate((hist,\
+      \ x))\n        if hist.size > self.keep:\n            hist = hist[-self.keep:]\n\
+      \        return hist\n\n    def _estimate(self):\n        W = self.window_len\n\
+      \        L = self.max_lag\n\n        if self.tx_hist.size < (W + L) or self.rx_hist.size\
+      \ < (W + L):\n            return None\n\n        tx = self.tx_hist\n       \
+      \ rx = self.rx_hist\n\n        tx_tail = tx[-(W + L):]\n        rx_tail = rx[-(W\
+      \ + L):]\n        rx_ref = rx_tail[-W:]\n\n        best_err = None\n       \
+      \ best_lag = 0\n\n        for lag in range(-L, L + 1):\n            if lag >=\
+      \ 0:\n                tx_win = tx_tail[-(W + lag): -lag] if lag != 0 else tx_tail[-W:]\n\
+      \                if tx_win.size != W:\n                    continue\n      \
+      \          err = np.count_nonzero(tx_win ^ rx_ref)\n            else:\n    \
+      \            k = -lag\n                rx_win = rx_tail[-(W + k): -k]\n    \
+      \            tx_win = tx_tail[-W:]\n                if rx_win.size != W:\n \
+      \                   continue\n                err = np.count_nonzero(tx_win\
+      \ ^ rx_win)\n\n            if best_err is None or err < best_err:\n        \
+      \        best_err = err\n                best_lag = lag\n\n        if best_err\
+      \ is None:\n            return None\n\n        ber = float(best_err) / float(W)\n\
+      \        return best_lag, ber\n\n    def work(self, input_items, output_items):\n\
+      \        tx_in = input_items[0].astype(np.uint8, copy=False)\n        rx_in\
+      \ = input_items[1].astype(np.uint8, copy=False)\n\n        n = min(len(tx_in),\
+      \ len(rx_in))\n        if n == 0:\n            return 0\n\n        tx_in = tx_in[:n]\n\
+      \        rx_in = rx_in[:n]\n\n        self.tx_hist = self._append_hist(self.tx_hist,\
+      \ tx_in)\n        self.rx_hist = self._append_hist(self.rx_hist, rx_in)\n\n\
+      \        # Continuously update BER estimate when possible\n        est = self._estimate()\n\
+      \        if est is not None:\n            lag, ber = est\n            self.cur_lag\
+      \ = np.float32(lag)\n            self.cur_ber = np.float32(ber)\n\n        #\
+      \ ---- TIME-BASED CSV LOGGING ----\n        now = time.time()\n        if (now\
+      \ - self._last_log_time) >= self.log_period:\n            self._last_log_time\
+      \ = now\n\n            self._csv_writer.writerow([\n                f\"{self.snr_db:.6f}\"\
+      ,\n                f\"{float(self.cur_ber):.10e}\"\n            ])\n       \
+      \     self._csv_file.flush()\n\n        return n\n\n    def stop(self):\n  \
+      \      try:\n            self._csv_file.close()\n        except Exception:\n\
+      \            pass\n        return True\n\n"
+    affinity: ''
+    alias: ''
+    append: 'True'
+    comment: ''
+    csv_path: '"metrics_pred6.csv"'
+    log_period: '.5'
+    max_lag: '2000'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    snr_db: snr_db_range
+    window_len: '1000000'
+    write_header: 'True'
+  states:
+    _io_cache: '(''ber_and_sync_csv'', ''blk'', [(''window_len'', ''4096''), (''max_lag'',
+      ''2000''), (''csv_path'', "''ber_log.csv''"), (''append'', ''True''), (''write_header'',
+      ''True''), (''snr_db'', ''0.0''), (''log_period'', ''1.0'')], [(''0'', ''byte'',
+      1), (''1'', ''byte'', 1)], [], ''\n    Bitstream BER + alignment estimator +
+      CSV logger (SNR, BER).\n\n    Inputs:\n      in0: TX bits (uchar 0/1)\n      in1:
+      RX bits (uchar 0/1)\n\n    Outputs:\n      none\n\n    Each update appends TWO
+      values to CSV: snr_db, ber\n    Logging happens every log_period seconds (default:
+      1.0s).\n    '', [''append'', ''csv_path'', ''log_period'', ''max_lag'', ''snr_db'',
+      ''window_len'', ''write_header''])'
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1072, 244.0]
+    rotation: 0
+    state: enabled
+- name: epy_block_1
+  id: epy_block
+  parameters:
+    _source_code: "import pmt\nfrom gnuradio import gr\n\nclass blk(gr.basic_block):\n\
+      \    \"\"\"\n    Event-driven stepper (NO threads).\n    On each incoming tick\
+      \ message at port 'in', publishes a PMT pair:\n        (symbol(varname), value)\n\
+      \    compatible with Message Pair to Var.\n\n    Wiring:\n      Message Strobe\
+      \ (out) -> this_block.in\n      this_block.out -> Message Pair to Var.inpair\n\
+      \    \"\"\"\n\n    def __init__(self, varname=\"snr_db_range\", start_val=-20.0,\
+      \ stop_val=7.0, step=1.0, publish_start=True):\n        gr.basic_block.__init__(self,\
+      \ name=\"stepper_msg_pair_no_threads\", in_sig=None, out_sig=None)\n\n     \
+      \   self.varname = str(varname)\n        self.start_val = float(start_val)\n\
+      \        self.stop_val = float(stop_val)\n        self.step = float(step)\n\n\
+      \        # current value\n        self.val = self.start_val\n\n        # ports\n\
+      \        self.message_port_register_in(pmt.intern(\"in\"))\n        self.set_msg_handler(pmt.intern(\"\
+      in\"), self._on_tick)\n        self.message_port_register_out(pmt.intern(\"\
+      out\"))\n\n        # behavior\n        self.publish_start = bool(publish_start)\n\
+      \n    def _publish(self):\n        key = pmt.intern(self.varname)\n        msg\
+      \ = pmt.cons(key, pmt.from_double(self.val))  # change to from_long(int(self.val))\
+      \ if you want ints\n        self.message_port_pub(pmt.intern(\"out\"), msg)\n\
+      \n    def _advance(self):\n        self.val += self.step\n        if self.val\
+      \ > self.stop_val:\n            self.val = self.start_val\n\n    def _on_tick(self,\
+      \ msg):\n        if self.publish_start:\n            self._publish()\n     \
+      \       self._advance()\n        else:\n            self._advance()\n      \
+      \      self._publish()\n\n"
+    affinity: ''
+    alias: ''
+    comment: ''
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    publish_start: 'True'
+    start_val: '-20'
+    step: '1'
+    stop_val: '10'
+    varname: '"snr_db_range"'
+  states:
+    _io_cache: ('stepper_msg_pair_no_threads', 'blk', [('varname', "'snr_db_range'"),
+      ('start_val', '-20.0'), ('stop_val', '7.0'), ('step', '1.0'), ('publish_start',
+      'True')], [('in', 'message', 1)], [('out', 'message', 1)], "\n    Event-driven
+      stepper (NO threads).\n    On each incoming tick message at port 'in', publishes
+      a PMT pair:\n        (symbol(varname), value)\n    compatible with Message Pair
+      to Var.\n\n    Wiring:\n      Message Strobe (out) -> this_block.in\n      this_block.out
+      -> Message Pair to Var.inpair\n    ", ['publish_start', 'start_val', 'step',
+      'stop_val', 'varname'])
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [248, 408.0]
+    rotation: 0
+    state: enabled
+- name: qtgui_const_sink_x_0
+  id: qtgui_const_sink_x
+  parameters:
+    affinity: ''
+    alias: ''
+    alpha1: '1.0'
+    alpha10: '1.0'
+    alpha2: '1.0'
+    alpha3: '1.0'
+    alpha4: '1.0'
+    alpha5: '1.0'
+    alpha6: '1.0'
+    alpha7: '1.0'
+    alpha8: '1.0'
+    alpha9: '1.0'
+    autoscale: 'False'
+    axislabels: 'True'
+    color1: '"blue"'
+    color10: '"dark blue"'
+    color2: '"red"'
+    color3: '"green"'
+    color4: '"black"'
+    color5: '"cyan"'
+    color6: '"magenta"'
+    color7: '"yellow"'
+    color8: '"dark red"'
+    color9: '"dark green"'
+    comment: ''
+    grid: 'False'
+    gui_hint: ''
+    label1: ''
+    label10: ''
+    label2: ''
+    label3: ''
+    label4: ''
+    label5: ''
+    label6: ''
+    label7: ''
+    label8: ''
+    label9: ''
+    legend: 'True'
+    marker1: '0'
+    marker10: '0'
+    marker2: '0'
+    marker3: '0'
+    marker4: '0'
+    marker5: '0'
+    marker6: '0'
+    marker7: '0'
+    marker8: '0'
+    marker9: '0'
+    name: '""'
+    nconnections: '1'
+    size: '1024'
+    style1: '0'
+    style10: '0'
+    style2: '0'
+    style3: '0'
+    style4: '0'
+    style5: '0'
+    style6: '0'
+    style7: '0'
+    style8: '0'
+    style9: '0'
+    tr_chan: '0'
+    tr_level: '0.0'
+    tr_mode: qtgui.TRIG_MODE_FREE
+    tr_slope: qtgui.TRIG_SLOPE_POS
+    tr_tag: '""'
+    type: complex
+    update_time: '0.10'
+    width1: '1'
+    width10: '1'
+    width2: '1'
+    width3: '1'
+    width4: '1'
+    width5: '1'
+    width6: '1'
+    width7: '1'
+    width8: '1'
+    width9: '1'
+    xmax: '2'
+    xmin: '-2'
+    ymax: '2'
+    ymin: '-2'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [656, 200.0]
+    rotation: 0
+    state: enabled
+
+connections:
+- [analog_agc_xx_0, '0', digital_constellation_decoder_cb_0, '0']
+- [blocks_file_source_0, '0', blocks_throttle2_0, '0']
+- [blocks_file_source_1, '0', epy_block_0, '0']
+- [blocks_message_strobe_0, strobe, epy_block_1, in]
+- [blocks_throttle2_0, '0', channels_channel_model_0, '0']
+- [channels_channel_model_0, '0', analog_agc_xx_0, '0']
+- [channels_channel_model_0, '0', qtgui_const_sink_x_0, '0']
+- [digital_constellation_decoder_cb_0, '0', epy_block_0, '1']
+- [epy_block_1, out, blocks_msgpair_to_var_0, inpair]
+
+metadata:
+  file_format: 1
+  grc_version: 3.10.9.2

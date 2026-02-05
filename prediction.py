@@ -6,7 +6,7 @@ import numpy as np
 import scipy.io as scio
 from argparse import ArgumentParser
 
-from stablediff.params import AttrDict, all_params
+from stablediff.params import AttrDict, params_simple
 from stablediff.models import tfdiff_WiFi, tfdiff_Simple
 from stablediff.diffusion import SignalDiffusion, GaussianDiffusion
 
@@ -100,7 +100,7 @@ def save_mat(path, iq_tensor, prompt, bits):
 
 
 def main(args):
-    params = all_params[args.task_id]
+    params = params_simple
     model_dir = args.model_dir or params.model_dir
     out_path = args.out_dir or params.out_dir  # this is a FILE path in your current usage
 
@@ -118,12 +118,7 @@ def main(args):
         checkpoint = torch.load(model_dir, map_location=device)
 
     # Build model
-    if params.task_id == 0:
-        model = tfdiff_WiFi(AttrDict(params)).to(device)
-    elif params.task_id == 1:
-        model = tfdiff_Simple(AttrDict(params)).to(device)
-    else:
-        raise ValueError(f"Unsupported task_id={params.task_id} for this script")
+    model = tfdiff_Simple(AttrDict(params)).to(device)
 
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -145,12 +140,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="runs inference (generation) process based on trained tfdiff model")
-    parser.add_argument(
-        "--task_id",
-        type=int,
-        default=0,
-        help="use case of tfdiff model, 0/1/2/3 for WiFi/FMCW/MIMO/EEG respectively",
-    )
+
     parser.add_argument(
         "--file",
         required=True,

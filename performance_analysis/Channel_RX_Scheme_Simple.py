@@ -10,7 +10,6 @@
 
 from PyQt5 import Qt
 from gnuradio import qtgui
-from PyQt5 import QtCore
 from gnuradio import analog
 from gnuradio import blocks
 import pmt
@@ -26,6 +25,7 @@ from argparse import ArgumentParser
 from gnuradio.eng_arg import eng_float, intx
 from gnuradio import eng_notation
 import Channel_RX_Scheme_Simple_epy_block_0 as epy_block_0  # embedded python block
+import Channel_RX_Scheme_Simple_epy_block_1 as epy_block_1  # embedded python block
 import sip
 
 
@@ -74,9 +74,6 @@ class Channel_RX_Scheme_Simple(gr.top_block, Qt.QWidget):
         # Blocks
         ##################################################
 
-        self._snr_db_range_range = qtgui.Range(-20, 40, 1, -20, 200)
-        self._snr_db_range_win = qtgui.RangeWidget(self._snr_db_range_range, self.set_snr_db_range, "SNR DB_RANGE", "counter_slider", float, QtCore.Qt.Horizontal)
-        self.top_layout.addWidget(self._snr_db_range_win)
         self.qtgui_const_sink_x_0 = qtgui.const_sink_c(
             1024, #size
             "", #name
@@ -118,7 +115,8 @@ class Channel_RX_Scheme_Simple(gr.top_block, Qt.QWidget):
 
         self._qtgui_const_sink_x_0_win = sip.wrapinstance(self.qtgui_const_sink_x_0.qwidget(), Qt.QWidget)
         self.top_layout.addWidget(self._qtgui_const_sink_x_0_win)
-        self.epy_block_0 = epy_block_0.blk(window_len=1000000, max_lag=2000, csv_path="metrics_pred3.csv", append=True, write_header=True, snr_db=snr_db_range, log_period=1)
+        self.epy_block_1 = epy_block_1.blk(varname="snr_db_range", start_val=-20, stop_val=10, step=1, publish_start=True)
+        self.epy_block_0 = epy_block_0.blk(window_len=1000000, max_lag=2000, csv_path="metrics_pred6.csv", append=True, write_header=True, snr_db=snr_db_range, log_period=.5)
         self.digital_constellation_decoder_cb_0 = digital.constellation_decoder_cb(digital.constellation_bpsk())
         self.channels_channel_model_0 = channels.channel_model(
             noise_voltage=(noise_voltage**0.5),
@@ -128,9 +126,11 @@ class Channel_RX_Scheme_Simple(gr.top_block, Qt.QWidget):
             noise_seed=0,
             block_tags=False)
         self.blocks_throttle2_0 = blocks.throttle( gr.sizeof_gr_complex*1, samp_rate, True, 0 if "auto" == "auto" else max( int(float(0.1) * samp_rate) if "auto" == "time" else int(0.1), 1) )
-        self.blocks_file_source_1 = blocks.file_source(gr.sizeof_char*1, '/home/rapcole12/Documents/RFLLM/dataset/simple/pred_bits3.bin', True, 0, 0)
+        self.blocks_msgpair_to_var_0 = blocks.msg_pair_to_var(self.set_snr_db_range)
+        self.blocks_message_strobe_0 = blocks.message_strobe(pmt.intern("tick"), 7000)
+        self.blocks_file_source_1 = blocks.file_source(gr.sizeof_char*1, '/home/rapcole12/Documents/RFLLM/dataset/simple/pred_bits6.bin', True, 0, 0)
         self.blocks_file_source_1.set_begin_tag(pmt.PMT_NIL)
-        self.blocks_file_source_0 = blocks.file_source(gr.sizeof_gr_complex*1, '/home/rapcole12/Documents/RFLLM/dataset/simple/pred3.bin', True, 0, 0)
+        self.blocks_file_source_0 = blocks.file_source(gr.sizeof_gr_complex*1, '/home/rapcole12/Documents/RFLLM/dataset/simple/pred6.bin', True, 0, 0)
         self.blocks_file_source_0.set_begin_tag(pmt.PMT_NIL)
         self.analog_agc_xx_0 = analog.agc_cc((1e-3), 1.0, 1.0, 65536)
 
@@ -138,6 +138,8 @@ class Channel_RX_Scheme_Simple(gr.top_block, Qt.QWidget):
         ##################################################
         # Connections
         ##################################################
+        self.msg_connect((self.blocks_message_strobe_0, 'strobe'), (self.epy_block_1, 'in'))
+        self.msg_connect((self.epy_block_1, 'out'), (self.blocks_msgpair_to_var_0, 'inpair'))
         self.connect((self.analog_agc_xx_0, 0), (self.digital_constellation_decoder_cb_0, 0))
         self.connect((self.blocks_file_source_0, 0), (self.blocks_throttle2_0, 0))
         self.connect((self.blocks_file_source_1, 0), (self.epy_block_0, 0))
