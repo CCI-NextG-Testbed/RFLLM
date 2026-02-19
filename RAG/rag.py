@@ -1,127 +1,95 @@
-import fitz              # PyMuPDF
-import pytesseract
-from PIL import Image
-import io
+import os
+import glob
 import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
-# -------------------------
-# CONFIG
-# -------------------------
-PDF_PATH = "PROTOTYPING_AND_DESIGN.pdf"  # change to your file
-BOOK_ID = "Juha_Heiskala_&_John_Terry"
-BOOK_TITLE = "OFDM Wireless LANs: A Theoretical and Practical Guide"
-CHAPTER_TITLE = "RAPID_PROTOTYPING_FOR_WLANs"
+EMBED_MODEL_NAME = "intfloat/e5-large-v2"
 
-CHUNK_SIZE_WORDS = 200   # ~ chunk length
-CHUNK_OVERLAP_WORDS = 75
+def _safe_str(x):
+    if x is None:
+        return ""
+    return str(x)
 
-OUTPUT_JSON = "PROTOTYPING_AND_DESIGN.json"
-
-
-# -------------------------
-# OCR: page -> text
-# -------------------------
-def ocr_page(page, dpi=300):
+def load_db_from_folder(folder: str):
     """
-    Convert a PyMuPDF page to text using Tesseract OCR.
+    Load all JSON files from a folder.
+    Each JSON contains either a dict or list[dict] records. Each record must include:
+      - embedding : list[float]
     """
-    pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    text = pytesseract.image_to_string(img)
-    # Clean up a bit
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.strip()
-    return text
+    all_records = []
+    pattern = os.path.join(folder, "*.json")
+    files = sorted(glob.glob(pattern))
 
-# -------------------------
-# Chunking logic
-# -------------------------
-def chunk_text(text, size=800, overlap=150):
-    """
-    Chunk text by words with overlap.
-    """
-    words = text.split()
-    if not words:
-        return []
+    for path in files:
+        print(f"  Loading {path} ...")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                data = [data]
+            for rec in data:
+                if "embedding" not in rec:
+                    raise ValueError(f"Record in {path} missing 'embedding' (id={rec.get('id')})")
+                all_records.append(rec)
 
-    chunks = []
-    start = 0
+    print(f"Total records loaded: {len(all_records)}")
+    if len(all_records) == 0:
+        return [], np.zeros((0, 1), dtype=np.float32)
 
-    while start < len(words):
-        end = min(start + size, len(words))
-        chunk_words = words[start:end]
-        chunk_text_str = " ".join(chunk_words)
-        chunks.append(chunk_text_str)
-        if end == len(words):
-            break
-        start = end - overlap  # slide back by overlap
+    emb_matrix = np.array([r["embedding"] for r in all_records], dtype=np.float32)
+    norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+    emb_matrix_norm = emb_matrix / np.clip(norms, 1e-9, None)
+    return all_records, emb_matrix_norm
 
-    return chunks
-
-
-# -------------------------
-# Main: OCR all pages, chunk, build objects
-# -------------------------
-def process_pdf(path):
-    doc = fitz.open(path)
-    all_chunks = []
-
-    print(f"Opened PDF: {path}")
-    print(f"Total pages: {doc.page_count}")
-
-    for page_index in range(doc.page_count):
-        page_num = page_index + 1
-        page = doc.load_page(page_index)
-
-        print(f"OCR-ing page {page_num}...")
-        text = ocr_page(page)
-
-        if not text:
-            print(f"  Page {page_num}: no text extracted (blank or OCR issue).")
-            continue
-
-        page_chunks = chunk_text(
-            text,
-            size=CHUNK_SIZE_WORDS,
-            overlap=CHUNK_OVERLAP_WORDS
+def build_context(results, max_chars: int = 4000) -> str:
+    pieces = []
+    for r in results:
+        header = (
+            f"--- Source: {r['id']} "
+            f"(page {r['page']}, chapter={r['chapter']}, "
+            f"section={r['section']}, subsection={r['subsection']}) ---\n"
         )
+        pieces.append(header + _safe_str(r.get("text", "")) + "\n")
 
-        print(f"  Page {page_num}: {len(page_chunks)} chunk(s) created.")
+    ctx = "\n".join(pieces)
+    if len(ctx) > max_chars:
+        ctx = ctx[:max_chars] + "\n...[truncated]..."
+    return ctx
 
-        for i, chunk_text_str in enumerate(page_chunks):
-            chunk_id = f"{BOOK_ID}_p{page_num}_c{i}"
+class RAGSearch:
+    def __init__(self, chunks_folder: str, embed_model_name: str = EMBED_MODEL_NAME):
+        print(f"Loading embedding model: {embed_model_name}")
+        self.model = SentenceTransformer(embed_model_name)  # add device="cuda" if you want
 
-            chunk_obj = {
-                "id": chunk_id,
-                "source": BOOK_ID,
-                "chapter" : CHAPTER_TITLE,
-                "book_title": BOOK_TITLE,
-                "page": page_num,
-                "chunk_index_on_page": i,
-                "text": chunk_text_str,
-            }
+        self.db, self.emb_norm = load_db_from_folder(chunks_folder)
+        if len(self.db) == 0:
+            raise RuntimeError(f"Chunks DB empty. Put JSON chunk files with embeddings in: {chunks_folder}")
 
-            all_chunks.append(chunk_obj)
+    def embed_query(self, text: str) -> np.ndarray:
+        vec = self.model.encode(text, convert_to_numpy=True).astype(np.float32)
+        norm = np.linalg.norm(vec)
+        return vec if norm == 0 else (vec / norm)
 
-    return all_chunks
+    def search(self, query_text: str, top_k: int):
+        q = self.embed_query(query_text)  # (D,)
+        sims = self.emb_norm @ q          # (N,)
+        top_idx = np.argsort(-sims)[:top_k]
 
+        results = []
+        for idx in top_idx:
+            rec = self.db[idx]
+            results.append(
+                {
+                    "id": rec.get("id"),
+                    "score": float(sims[idx]),
+                    "page": rec.get("page"),
+                    "chapter": rec.get("chapter"),
+                    "section": rec.get("section", rec.get("section_num")),
+                    "subsection": rec.get("subsection", rec.get("subsection_num")),
+                    "source": rec.get("source"),
+                    "book_title": rec.get("book_title"),
+                    "text": rec.get("text", ""),
+                }
+            )
+        return results
 
-if __name__ == "__main__":
-    chunks = process_pdf(PDF_PATH)
-
-    print("\n================ SUMMARY ================\n")
-    print(f"Total chunks created: {len(chunks)}\n")
-
-    # Save all chunks to JSON file
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-
-    print(f"Chunks saved to: {OUTPUT_JSON}\n")
-
-    # Print first 3 chunks as formatted JSON, truncating text preview
-    print("Sample chunks:\n")
-    for c in chunks[:3]:
-        preview = c["text"][:300] + ("..." if len(c["text"]) > 300 else "")
-        display_obj = {**c, "text": preview}
-        print(json.dumps(display_obj, indent=2))
-        print("\n---------------------------------------------\n")

@@ -50,6 +50,15 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
         return len(self.filenames)
 
     @staticmethod
+    def _parse_modulation(label: str, filename: str) -> str:
+        u_label = str(label).upper()
+        u_file = str(filename).upper()
+        for m in ("256QAM", "64QAM", "16QAM", "8PSK", "QPSK", "BPSK"):
+            if m in u_label or m in u_file:
+                return m
+        return "BPSK"
+
+    @staticmethod
     def _mat_to_str(x) -> str:
         # Handles MATLAB char arrays and scalar arrays
         if isinstance(x, str):
@@ -111,11 +120,15 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
         x = self._mat_to_complex_1d(cur_sample["data"])  # np complex64 [L]
         bits = np.asarray(cur_sample["bits"]).reshape(-1)  # np [Lb]
         label = self._mat_to_str(cur_sample["label"])
+        modulation = self._mat_to_str(cur_sample["modulation"]) if "modulation" in cur_sample else self._parse_modulation(label, cur_filename)
+        sps = int(np.asarray(cur_sample["samples_per_symbol"]).squeeze()) if "samples_per_symbol" in cur_sample else 1
 
         return {
             "data": x,      # np.complex64 [L]
             "bits": bits,   # np (numeric) [Lb]
-            "label": label  # str
+            "label": label, # str
+            "modulation": str(modulation).upper().replace("-", "").replace(" ", ""),
+            "samples_per_symbol": max(1, sps),
         }
 
 
@@ -135,6 +148,41 @@ class Collator:
         self.params = params
         self.normalize = normalize
 
+    @staticmethod
+    def _mod_order(modulation: str) -> int:
+        m = str(modulation).upper()
+        if m == "BPSK":
+            return 2
+        if m == "QPSK":
+            return 4
+        if m == "8PSK":
+            return 8
+        if m == "16QAM":
+            return 16
+        if m == "64QAM":
+            return 64
+        if m == "256QAM":
+            return 256
+        return 2
+
+    @staticmethod
+    def _bits_per_symbol(modulation: str) -> int:
+        M = Collator._mod_order(modulation)
+        return int(np.log2(M))
+
+    @staticmethod
+    def _bits_to_symbol_index(bits: np.ndarray, k: int) -> np.ndarray:
+        """
+        bits: 1D {0,1}
+        returns symbol indices [T] using MSB-first packing
+        """
+        if bits.size < k:
+            return np.zeros((0,), dtype=np.float32)
+        T = bits.size // k
+        bb = bits[: T * k].reshape(T, k).astype(np.int64)
+        w = (2 ** np.arange(k - 1, -1, -1)).astype(np.int64)
+        return (bb * w[None, :]).sum(axis=1).astype(np.float32)
+
     def collate(self, minibatch):
         N = int(self.params.sample_rate)     # desired length (e.g., 1024)
         feat_dim = int(self.params.input_dim)
@@ -143,7 +191,11 @@ class Collator:
 
         data_list = []
         bits_list = []
+        bits_full_list = []
+        bits_len_list = []
         prompt_list = []
+        modulation_list = []
+        sps_list = []
 
         for record in minibatch:
             # ---------- IQ ----------
@@ -189,6 +241,8 @@ class Collator:
 
             # ---------- prompt ----------
             prompt_list.append(str(record["label"]))
+            modulation_list.append(str(record.get("modulation", "BPSK")).upper())
+            sps_list.append(int(record.get("samples_per_symbol", 1)))
 
             # ---------- bits (sequence) ----------
             b = record["bits"]
@@ -200,28 +254,44 @@ class Collator:
             # numeric + force 0/1
             if not np.issubdtype(b_t.dtype, np.number):
                 raise ValueError("bits must be numeric (0/1).")
-
-            # crop/pad to N to align with IQ length
-            if b_t.size < N:
-                b_t = np.pad(b_t.astype(np.float32), (0, N - b_t.size), mode="constant")
-            elif b_t.size > N:
-                b_t = b_t[:N].astype(np.float32)
-            else:
-                b_t = b_t.astype(np.float32)
-
-            # force to 0/1 (handles {-1,+1} too)
-            # If your bits are already 0/1, this keeps them the same.
             b_t = (b_t != 0).astype(np.float32)
+            bits_full_list.append(torch.from_numpy(b_t))
+            bits_len_list.append(int(b_t.size))
 
-            bits_list.append(torch.from_numpy(b_t))  # [N]
+            # Build modulation-aware conditioning sequence [N] from symbol indices.
+            k = self._bits_per_symbol(record.get("modulation", "BPSK"))
+            M = self._mod_order(record.get("modulation", "BPSK"))
+            sym_idx = self._bits_to_symbol_index(b_t, k)
+            if sym_idx.size == 0:
+                bits_cond = np.zeros((N,), dtype=np.float32)
+            else:
+                if M > 1:
+                    sym_idx = sym_idx / float(M - 1)
+                sps_i = max(1, int(record.get("samples_per_symbol", 1)))
+                bits_cond = np.repeat(sym_idx, sps_i).astype(np.float32)
+                if bits_cond.size < N:
+                    bits_cond = np.pad(bits_cond, (0, N - bits_cond.size), mode="constant")
+                elif bits_cond.size > N:
+                    bits_cond = bits_cond[:N]
+            bits_list.append(torch.from_numpy(bits_cond))  # [N]
 
         data = torch.stack(data_list, dim=0)         # [B,N,1,2]
         bits = torch.stack(bits_list, dim=0)         # [B,N]
+        bits_len = torch.tensor(bits_len_list, dtype=torch.int64)
+        max_bits = int(max(bits_len_list)) if bits_len_list else 0
+        bits_full = torch.zeros(len(bits_full_list), max_bits, dtype=torch.float32)
+        for i, b in enumerate(bits_full_list):
+            bits_full[i, :b.numel()] = b.to(torch.float32)
+        sps = torch.tensor(sps_list, dtype=torch.int64)
 
         return {
             "data": data,
             "prompt": prompt_list,
-            "bits": bits
+            "bits_cond": bits,
+            "bits_full": bits_full,
+            "bits_len": bits_len,
+            "modulation": modulation_list,
+            "samples_per_symbol": sps,
         }
 
 def from_path(params, is_distributed=False):

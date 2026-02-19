@@ -7,7 +7,7 @@ import scipy.io as scio
 from argparse import ArgumentParser
 
 from stablediff.params import AttrDict, params_simple
-from stablediff.models import tfdiff_WiFi, tfdiff_Simple
+from stablediff.models import tfdiff_Simple
 from stablediff.diffusion import SignalDiffusion, GaussianDiffusion
 
 
@@ -82,6 +82,19 @@ def load_cond_from_mat(mat_path: str, prompt_key="prompt", bits_key="bits"):
     return prompt, bits
 
 
+def build_bits_cond(bits: np.ndarray, N: int) -> np.ndarray:
+    bits = np.asarray(bits).reshape(-1)
+    bits = (bits != 0).astype(np.float32)
+    if bits.size == 0:
+        return np.zeros((N,), dtype=np.float32)
+    if bits.size == N:
+        return bits.astype(np.float32, copy=False)
+    # Prompt is handled by learned text-conditioning in the model.
+    # Here we only map raw bitstream to length N without modulation heuristics.
+    idx = np.floor(np.linspace(0, bits.size - 1, N)).astype(np.int64)
+    return bits[idx].astype(np.float32, copy=False)
+
+
 def save_mat(path, iq_tensor, prompt, bits):
     """
     iq_tensor: [B, N, input_dim, 2]
@@ -127,15 +140,16 @@ def main(args):
     # Build diffusion
     diffusion = SignalDiffusion(params) if params.signal_diffusion else GaussianDiffusion(params)
 
-    # Load conditioning from .mat file (prompt + bits)
-    prompt, bits = load_cond_from_mat(args.file, prompt_key="prompt", bits_key="bits")
+    # Load conditioning from .mat.
+    user_prompt, bits = load_cond_from_mat(args.file, prompt_key="prompt", bits_key="bits")
+    bits_cond = build_bits_cond(bits, N=int(params.sample_rate))
 
     with torch.no_grad():
-        cond = {"prompt": prompt, "bits": bits}  # bits is np.uint8 1D vector
+        cond = {"prompt": user_prompt, "bits_cond": bits_cond}
         pred = diffusion.sampling(model, cond, device)
 
     print(f"Saving to {out_path}")
-    save_mat(out_path, pred, prompt, bits)
+    save_mat(out_path, pred, user_prompt, bits)
 
 
 if __name__ == "__main__":
@@ -165,6 +179,11 @@ if __name__ == "__main__":
         "--device",
         default="cuda",
         help="device for data generation (script currently uses cpu unless you change it)",
+    )
+    parser.add_argument("--chunks_folder",
+        type=str,
+        default="./RAG/Knowledge_Base/Chunks",
+        help="Folder with JSON chunk files (must include embeddings).",
     )
 
     main(parser.parse_args())

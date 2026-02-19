@@ -9,7 +9,6 @@ from argparse import ArgumentParser
 
 from stablediff.params import params_simple
 from stablediff.learner import tfdiffLearner
-from stablediff.models import tfdiff_WiFi
 from stablediff.models import tfdiff_Simple
 from stablediff.dataset import from_path
 
