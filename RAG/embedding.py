@@ -1,9 +1,9 @@
 from sentence_transformers import SentenceTransformer
 import json
 
-INPUT_JSON = "./Knowledge_Base/Chunks/WLAN_OVERVIEW.json"
-OUTPUT_JSON = "./Knowledge_Base/Chunks/WLAN_OVERVIEW.json"
-MODEL_NAME = "thenlper/gte-large"
+INPUT_JSON = "./Knowledge_Base/Chunks/QUADRATURE_AMPLITUDE_MODULATION.json"
+OUTPUT_JSON = "./Knowledge_Base/Chunks/QUADRATURE_AMPLITUDE_MODULATION.json"
+MODEL_NAME = "intfloat/e5-large-v2"
 
 print("Loading model:", MODEL_NAME)
 model = SentenceTransformer(MODEL_NAME)
@@ -46,3 +46,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

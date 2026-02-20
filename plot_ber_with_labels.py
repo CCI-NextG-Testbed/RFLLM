@@ -51,7 +51,7 @@ def main():
 
     # axis + behavior
     ap.add_argument("--out", default="", help="Optional output image path (e.g., ber_vs_snr.png)")
-    ap.add_argument("--xmax", type=float, default=10.0, help="Max SNR on x-axis (default 10 dB)")
+    ap.add_argument("--xmax", type=float, default=15.0, help="Max SNR on x-axis (default 10 dB)")
     ap.add_argument("--ymin", type=float, default=1e-5, help="Min BER on y-axis (default 1e-5)")
     ap.add_argument("--ymax", type=float, default=1.0, help="Max BER on y-axis (default 1)")
     ap.add_argument(
