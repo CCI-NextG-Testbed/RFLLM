@@ -125,3 +125,4 @@ if __name__ == "__main__":
         display_obj = {**c, "text": preview}
         print(json.dumps(display_obj, indent=2))
         print("\n---------------------------------------------\n")
+

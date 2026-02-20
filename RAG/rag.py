@@ -92,4 +92,3 @@ class RAGSearch:
                 }
             )
         return results
-
