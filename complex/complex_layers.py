@@ -90,7 +90,6 @@ class ComplexMaxPool3d(Module):
                                 dilation = self.dilation, ceil_mode = self.ceil_mode,
                                 return_indices = self.return_indices)
     
-
 class ComplexAvgPool2d(Module):
 
     def __init__(self,kernel_size, stride= None, padding = 0,
@@ -108,7 +107,6 @@ class ComplexAvgPool2d(Module):
                                 stride = self.stride, padding = self.padding,
                                 dilation = self.dilation, ceil_mode = self.ceil_mode,
                                 return_indices = self.return_indices)
-
 
 class ComplexReLU(Module):
 

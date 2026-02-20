@@ -214,4 +214,3 @@ class GaussianDiffusion(nn.Module):
         # Restore data from noise.
         x_0_hat = restore_fn(x_s, batch_max, cond)
         return x_0_hat
-    

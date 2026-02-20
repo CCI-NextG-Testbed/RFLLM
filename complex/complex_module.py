@@ -407,7 +407,6 @@ def _merge_heads_complex(x):
     assert two == 2
     return x.permute(0, 2, 1, 3, 4).contiguous().view(B, S, H * hd, 2)
 
-
 class CosineAttentionCausal(nn.Module):
     def __init__(self, num_heads, eps=1e-8):
         super().__init__()
