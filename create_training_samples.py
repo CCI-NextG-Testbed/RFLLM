@@ -139,6 +139,77 @@ def build_llm_prompt(params: dict, context: str) -> str:
     """.strip()
 
 
+def build_label_variants(params: dict, context: str, llm, labels_per_sample: int):
+    """
+    Create multiple label variants for the same IQ/bits sample.
+    Mixes structured template labels and LLM-generated labels with different styles.
+    """
+    mod = _safe_str(params.get("Modulation")).strip().upper().replace("-", "").replace(" ", "")
+    N = int(params.get("Number of Samples"))
+    fs = float(params.get("Sampling Rate (Hz)"))
+    amp = float(params.get("Amplitude"))
+    fc = float(params.get("Center Frequency (Hz)"))
+    phase = float(params.get("Phase (degrees)"))
+    sps = int(params.get("Samples Per Symbol", 1) or 1)
+
+    styles = [
+        "simple",
+        "informative",
+        "technical",
+        "natural",
+    ]
+
+    template_map = {
+        "simple": f"Generate a {mod} IQ signal.",
+        "informative": (
+            f"Generate a {mod} baseband IQ signal with N={N}, fs={fs} Hz, "
+            f"samples_per_symbol={sps}, amplitude={amp}, center_frequency={fc} Hz, and phase={phase} deg."
+        ),
+        "technical": (
+            f"Create a {mod} communication waveform in complex IQ form, preserving symbol mapping, "
+            f"constellation structure, and decision boundaries for reliable demodulation."
+        ),
+        "natural": (
+            f"Please produce a realistic {mod} signal using complex I/Q samples, suitable for digital transmission."
+        ),
+    }
+
+    variants = []
+    for i in range(max(1, int(labels_per_sample))):
+        style = styles[i % len(styles)]
+        seed_label = template_map[style]
+
+        prompt = f"""
+            SIGNAL CONFIG (authoritative):
+            Modulation={mod}; N={N}; sampling_rate_hz={fs}; samples_per_symbol={sps}; amplitude={amp}; center_frequency_hz={fc}; initial_phase_deg={phase}.
+
+            LABEL STYLE:
+            {style}
+
+            CONTEXT (use only facts stated here):
+            {context}
+
+            Write exactly TWO sentences as a training label for this signal.
+            Keep the style as requested. Keep it concise and modulation-grounded.
+        """.strip()
+
+        try:
+            raw = llm.generate(
+                prompt,
+                max_new_tokens=196,
+                temperature=0.25 + 0.1 * (i % len(styles)),
+                top_p=0.9,
+            )
+            label = json.dumps(raw) if isinstance(raw, (list, dict)) else str(raw).strip()
+            if not label:
+                label = seed_label
+        except Exception:
+            label = seed_label
+
+        variants.append({"style": style, "label": label})
+    return variants
+
+
 # ===========================
 # Modulation / Signal Generation
 # ===========================
@@ -303,7 +374,7 @@ def generate_iq_from_excel_params(params: dict):
 # ===========================
 # Main Excel Loop
 # ===========================
-def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str):
+def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str, labels_per_sample: int):
     os.makedirs(out_dir, exist_ok=True)
 
     df = pd.read_excel(excel_path)
@@ -378,15 +449,8 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str)
         # 3) Build context
         context = build_context(results, max_chars=4000)
 
-        # 4) LLM label
-        prompt = build_llm_prompt(params, context)
-        raw_label = llm.generate(
-            prompt,
-            max_new_tokens=384,
-            temperature=0.2,
-            top_p=0.9,
-        )
-        label_text = json.dumps(raw_label) if isinstance(raw_label, (list, dict)) else str(raw_label).strip()
+        # 4) Multi-label generation for this single IQ/bits sample
+        label_variants = build_label_variants(params, context, llm, labels_per_sample)
 
         # 5) Save MAT
         output_name = _safe_str(row.get("Output Name")).strip()
@@ -397,23 +461,24 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str)
                 f"{row.get('Modulation')}_N{row.get('Number of Samples')}_sps{row.get('Samples Per Symbol', 1)}_amp{row.get('Amplitude')}_fc{row.get('Center Frequency (Hz)')}_ph{row.get('Phase (degrees)')}_row{idx}"
             )
 
-        mat_path = os.path.join(out_dir, f"{stem}.mat")
         mod_name = _safe_str(params.get("Modulation")).strip().upper().replace("-", "").replace(" ", "")
         sps_val = int(params.get("Samples Per Symbol", 1) or 1)
         k_val = bits_per_symbol(mod_name)
-
-        mat_dict = {
-            "data": iq_data.astype(np.complex64),
-            "bits": bits.astype(np.int8),
-            "modulation": np.array([mod_name], dtype=object),
-            "bits_per_symbol": np.array([[k_val]], dtype=np.int32),
-            "samples_per_symbol": np.array([[sps_val]], dtype=np.int32),
-            "label": label_text,
-            "rag_results": rag_results_struct,
-        }
-        savemat(mat_path, mat_dict)
-        print(f"  Saved MAT file: {mat_path}")
-        print(f"  Keys: data (complex64), bits (int8), modulation (str), bits_per_symbol (int), samples_per_symbol (int), label (str), rag_results (struct array)")
+        n_variants = len(label_variants)
+        for j, lv in enumerate(label_variants):
+            mat_path = os.path.join(out_dir, f"{stem}_v{j:02d}.mat")
+            mat_dict = {
+                "data": iq_data.astype(np.complex64),
+                "bits": bits.astype(np.int8),
+                "modulation": np.array([mod_name], dtype=object),
+                "bits_per_symbol": np.array([[k_val]], dtype=np.int32),
+                "samples_per_symbol": np.array([[sps_val]], dtype=np.int32),
+                "label": lv["label"],
+                "rag_results": rag_results_struct,
+            }
+            savemat(mat_path, mat_dict)
+            print(f"  Saved MAT file: {mat_path}  [variant {j+1}/{n_variants}, style={lv['style']}]")
+        print("  Keys: data (complex64), bits (int8), modulation (str), bits_per_symbol (int), samples_per_symbol (int), label (str), rag_results (struct array)")
 
 
 def main():
@@ -427,9 +492,15 @@ def main():
         default="./RAG/Knowledge_Base/Chunks",
         help="Folder with JSON chunk files (must include embeddings).",
     )
+    ap.add_argument(
+        "--labels_per_sample",
+        type=int,
+        default=1,
+        help="Number of distinct label variants to generate per IQ sample (same data/bits, different label text).",
+    )
     args = ap.parse_args()
 
-    process_excel(args.excel, args.out_dir, args.top_k, args.chunks_folder)
+    process_excel(args.excel, args.out_dir, args.top_k, args.chunks_folder, args.labels_per_sample)
 
 
 if __name__ == "__main__":

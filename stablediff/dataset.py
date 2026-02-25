@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import scipy.io as scio
 from stablediff.params import AttrDict
 from glob import glob
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 # data_key='csi_data',
@@ -55,6 +55,21 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
         u_file = str(filename).upper()
         for m in ("256QAM", "64QAM", "16QAM", "8PSK", "QPSK", "BPSK"):
             if m in u_label or m in u_file:
+                return m
+        return "BPSK"
+
+    @staticmethod
+    def _normalize_modulation_text(x: str) -> str:
+        """
+        Normalize messy MATLAB/object-string modulation values into canonical tokens.
+        Examples handled:
+          "['QPSK']" -> "QPSK"
+          " qpsk "   -> "QPSK"
+        """
+        s = str(x).upper()
+        s = "".join(ch for ch in s if ch.isalnum())
+        for m in ("256QAM", "64QAM", "16QAM", "8PSK", "QPSK", "BPSK"):
+            if m in s:
                 return m
         return "BPSK"
 
@@ -120,14 +135,15 @@ class SimpleSignalDataset(torch.utils.data.Dataset):
         x = self._mat_to_complex_1d(cur_sample["data"])  # np complex64 [L]
         bits = np.asarray(cur_sample["bits"]).reshape(-1)  # np [Lb]
         label = self._mat_to_str(cur_sample["label"])
-        modulation = self._mat_to_str(cur_sample["modulation"]) if "modulation" in cur_sample else self._parse_modulation(label, cur_filename)
+        modulation_raw = self._mat_to_str(cur_sample["modulation"]) if "modulation" in cur_sample else self._parse_modulation(label, cur_filename)
+        modulation = self._normalize_modulation_text(modulation_raw)
         sps = int(np.asarray(cur_sample["samples_per_symbol"]).squeeze()) if "samples_per_symbol" in cur_sample else 1
 
         return {
             "data": x,      # np.complex64 [L]
             "bits": bits,   # np (numeric) [Lb]
             "label": label, # str
-            "modulation": str(modulation).upper().replace("-", "").replace(" ", ""),
+            "modulation": modulation,
             "samples_per_symbol": max(1, sps),
         }
 
@@ -309,6 +325,107 @@ def from_path(params, is_distributed=False):
         pin_memory=True,
         drop_last=False,
         persistent_workers=True)
+
+
+def from_path_split(params, val_split=0.2, split_seed=42):
+    data_dir = params.data_dir
+    dataset = SimpleSignalDataset(data_dir)
+
+    n_total = len(dataset)
+    if n_total < 2:
+        raise ValueError("Train/test split requires at least 2 samples.")
+    if not (0.0 < float(val_split) < 1.0):
+        raise ValueError(f"val_split must be in (0,1). Got {val_split}.")
+
+    n_val = max(1, int(round(n_total * float(val_split))))
+    n_train = n_total - n_val
+    if n_train < 1:
+        n_train = 1
+        n_val = n_total - 1
+
+    gen = torch.Generator().manual_seed(int(split_seed))
+    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=gen)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=params.batch_size,
+        collate_fn=Collator(params).collate,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds,
+        batch_size=params.batch_size,
+        collate_fn=Collator(params).collate,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=False,
+    )
+    return train_loader, val_loader
+
+
+def from_path_modulation_holdout(params, test_per_mod=1, mods=("BPSK", "QPSK", "8PSK"), split_seed=42):
+    data_dir = params.data_dir
+    dataset = SimpleSignalDataset(data_dir)
+    rng = random.Random(int(split_seed))
+
+    mods = [str(m).upper() for m in mods]
+    mod_to_indices = {m: [] for m in mods}
+
+    for idx in range(len(dataset.filenames)):
+        cur_filename = dataset.filenames[idx]
+        cur_sample = scio.loadmat(cur_filename, verify_compressed_data_integrity=False)
+        if "modulation" in cur_sample:
+            modulation_raw = SimpleSignalDataset._mat_to_str(cur_sample["modulation"])
+            modulation = SimpleSignalDataset._normalize_modulation_text(modulation_raw)
+        else:
+            label = SimpleSignalDataset._mat_to_str(cur_sample.get("label", ""))
+            modulation = SimpleSignalDataset._parse_modulation(label, cur_filename)
+        if modulation in mod_to_indices:
+            mod_to_indices[modulation].append(idx)
+
+    test_indices = []
+    for m in mods:
+        idxs = mod_to_indices.get(m, [])
+        if len(idxs) < int(test_per_mod):
+            raise ValueError(f"Not enough samples for {m}: need {test_per_mod}, found {len(idxs)}")
+        rng.shuffle(idxs)
+        test_indices.extend(idxs[:int(test_per_mod)])
+
+    test_set = set(test_indices)
+    train_indices = [i for i in range(len(dataset.filenames)) if i not in test_set]
+    if len(train_indices) == 0:
+        raise ValueError("No training samples left after modulation holdout split.")
+
+    train_ds = Subset(dataset, train_indices)
+    test_ds = Subset(dataset, sorted(test_indices))
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=params.batch_size,
+        collate_fn=Collator(params).collate,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=True,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_ds,
+        batch_size=params.batch_size,
+        collate_fn=Collator(params).collate,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=False,
+    )
+    return train_loader, test_loader
 
 
 def from_path_inference(params):

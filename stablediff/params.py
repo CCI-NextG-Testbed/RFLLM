@@ -29,7 +29,10 @@ params_simple = AttrDict(
     max_grad_norm=None,
     loss_alpha=0.6,
     symbol_tau=0.1,
-    loss_ema_beta=0.99,
+    mod_loss_weight=0.0,
+    test_per_mod=1,
+    test_mods=["BPSK", "QPSK", "8PSK"],
+    split_seed=42,
     sample_rate=2048,              # length of each signal
     input_dim=1,
     extra_dim=[1],
@@ -47,4 +50,11 @@ params_simple = AttrDict(
     blur_schedule=((1e-5**2) * np.ones(100)).tolist(),
     # \beta_t, noise level added to the signal on each diffusion step [T]
     noise_schedule=np.linspace(1e-4, 0.003, 100).tolist(),
+    animate_after_training=False,
+    training_animation_out="./results/training_mods.gif",
+    training_animation_mods=["BPSK", "QPSK", "8PSK"],
+    training_animation_wave_samples=400,
+    training_animation_wave_stride=2,
+    training_animation_max_symbols=256,
+    training_animation_fps=2,
 )
