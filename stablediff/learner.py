@@ -18,11 +18,14 @@ except Exception:
 
 
 class IQPlusBitsLoss(nn.Module):
-    def __init__(self, alpha=0.6, tau=0.1, eps=1e-8):
+    def __init__(self, alpha=0.6, tau=0.1, ema_beta=0.99, eps=1e-8):
         super().__init__()
-        self.alpha = float(alpha)
-        self.tau = float(tau)
+        self.alpha = alpha
+        self.tau = tau
+        self.ema_beta = ema_beta
         self.eps = eps
+        self.ema_iq = None
+        self.ema_sym = None
 
     @staticmethod
     def complex_mse(target_ri, est_ri):
@@ -31,41 +34,18 @@ class IQPlusBitsLoss(nn.Module):
         est_c    = torch.view_as_complex(est_ri)
         return torch.mean(torch.abs(target_c - est_c) ** 2)
 
-    def _symbol_evm_loss(self, est_c, target_c, sps):
-        # est_c, target_c: [B,N] complex
-        B, N = est_c.shape
-        losses = []
-        for i in range(B):
-            sps_i = max(1, int(sps[i].item()))
-            T = N // sps_i
-            if T <= 0:
-                continue
-
-            # predicted symbols at symbol-rate
-            est_i = est_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-            tgt_i = target_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-
-            if rfml_evm is not None:
-                est_ri = torch.stack((est_i.real, est_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                tgt_ri = torch.stack((tgt_i.real, tgt_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
-                losses.append(torch.mean(rfml_evm(est_ri, tgt_ri)))
-            else:
-                # fallback normalized RMS EVM
-                num = torch.mean(torch.abs(est_i - tgt_i) ** 2)
-                den = torch.mean(torch.abs(tgt_i) ** 2).clamp(min=self.eps)
-                losses.append(torch.sqrt(num / den))
-
-        if len(losses) == 0:
-            return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        return torch.stack(losses).mean()
-
     @staticmethod
-    def _normalize_mod(mod):
-        return str(mod).upper().replace("-", "").replace(" ", "")
+    def _gray_to_binary_t(x: torch.Tensor) -> torch.Tensor:
+        b = x.clone()
+        shift = 1
+        while shift < 32:
+            b = torch.bitwise_xor(b, torch.bitwise_right_shift(b, shift))
+            shift <<= 1
+        return b
 
     @staticmethod
     def _bits_per_symbol(mod: str) -> int:
-        m = IQPlusBitsLoss._normalize_mod(mod)
+        m = str(mod).upper()
         if m == "BPSK":
             return 1
         if m == "QPSK":
@@ -80,53 +60,36 @@ class IQPlusBitsLoss(nn.Module):
             return 8
         return 1
 
-    @staticmethod
-    def _gray_to_binary_t(x: torch.Tensor) -> torch.Tensor:
-        b = x.clone()
-        shift = 1
-        while shift < 32:
-            b = torch.bitwise_xor(b, torch.bitwise_right_shift(b, shift))
-            shift <<= 1
-        return b
-
-    @staticmethod
-    def _int_to_bits(vals: torch.Tensor, k: int) -> torch.Tensor:
-        shifts = torch.arange(k - 1, -1, -1, device=vals.device, dtype=torch.int64)
-        return ((vals.unsqueeze(1) >> shifts.unsqueeze(0)) & 1).to(torch.float32)
-
-    def _constellation_with_bit_labels(self, mod: str, device):
-        m = self._normalize_mod(mod)
+    def _constellation_points(self, mod: str, device):
+        m = str(mod).upper()
         if m == "BPSK":
-            pts = torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
-            bits = torch.tensor([[0.0], [1.0]], dtype=torch.float32, device=device)
-            return pts, bits
+            return torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
 
         if m == "QPSK":
-            vals = torch.arange(4, dtype=torch.int64, device=device)
-            bits = self._int_to_bits(vals, 2)  # [4,2], b0->I, b1->Q
-            I = 2.0 * bits[:, 0] - 1.0
-            Q = 2.0 * bits[:, 1] - 1.0
-            pts = (I + 1j * Q).to(torch.complex64) / np.sqrt(2.0)
-            return pts, bits
+            return torch.tensor(
+                [-1.0 - 1.0j, -1.0 + 1.0j, 1.0 - 1.0j, 1.0 + 1.0j],
+                dtype=torch.complex64,
+                device=device,
+            ) / np.sqrt(2.0)
 
         if m == "8PSK":
-            g = torch.arange(8, dtype=torch.int64, device=device)   # gray labels (bit labels)
-            idx = self._gray_to_binary_t(g)                         # phase index
+            g = torch.arange(8, dtype=torch.int64, device=device)
+            idx = self._gray_to_binary_t(g)
             phase = 2.0 * torch.pi * idx.to(torch.float32) / 8.0
-            pts = torch.exp(1j * phase).to(torch.complex64)
-            bits = self._int_to_bits(g, 3)                          # labels are gray bits
-            return pts, bits
+            return torch.exp(1j * phase).to(torch.complex64)
 
         if m in ("16QAM", "64QAM", "256QAM"):
             M = int(m.replace("QAM", ""))
             k = int(np.log2(M))
             k2 = k // 2
             vals = torch.arange(M, dtype=torch.int64, device=device)
-            bits = self._int_to_bits(vals, k)  # gray labels by construction
+
+            shifts = torch.arange(k - 1, -1, -1, device=device, dtype=torch.int64)
+            bits = ((vals.unsqueeze(1) >> shifts.unsqueeze(0)) & 1).to(torch.int64)  # [M,k]
 
             w = (2 ** torch.arange(k2 - 1, -1, -1, device=device, dtype=torch.int64))
-            gI = (bits[:, :k2].to(torch.int64) * w.unsqueeze(0)).sum(dim=1)
-            gQ = (bits[:, k2:].to(torch.int64) * w.unsqueeze(0)).sum(dim=1)
+            gI = (bits[:, :k2] * w.unsqueeze(0)).sum(dim=1)
+            gQ = (bits[:, k2:] * w.unsqueeze(0)).sum(dim=1)
             bI = self._gray_to_binary_t(gI)
             bQ = self._gray_to_binary_t(gQ)
 
@@ -135,14 +98,19 @@ class IQPlusBitsLoss(nn.Module):
             aQ = (2.0 * bQ.to(torch.float32) - (L - 1)).to(torch.float32)
             pts = (aI + 1j * aQ).to(torch.complex64)
             p = torch.mean(torch.abs(pts) ** 2).clamp(min=self.eps)
-            pts = pts / torch.sqrt(p)
-            return pts, bits
+            return pts / torch.sqrt(p)
 
-        pts = torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
-        bits = torch.tensor([[0.0], [1.0]], dtype=torch.float32, device=device)
-        return pts, bits
+        # fallback
+        return torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
 
-    def _bit_demod_ce_loss(self, est_c, bits_full, bits_len, modulation, sps):
+    @staticmethod
+    def _bits_to_index(bits: torch.Tensor) -> torch.Tensor:
+        # bits: [T,k] with MSB-first
+        k = bits.shape[1]
+        w = (2 ** torch.arange(k - 1, -1, -1, device=bits.device, dtype=torch.float32))
+        return torch.sum(bits * w.unsqueeze(0), dim=1).long()
+
+    def _symbol_ce_loss(self, est_c, bits_full, bits_len, modulation, sps):
         # est_c: [B,N] complex
         B, N = est_c.shape
         losses = []
@@ -160,52 +128,51 @@ class IQPlusBitsLoss(nn.Module):
             if T <= 0:
                 continue
 
+            # predicted symbols at symbol-rate
             est_i = est_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
-            tgt_bits = bits_full[i, : T * k].view(T, k).to(est_i.device).float()  # [T,k]
 
-            pts, bit_labels = self._constellation_with_bit_labels(mod_i, est_i.device)  # [M], [M,k]
-            ll = -torch.abs(est_i.unsqueeze(1) - pts.unsqueeze(0)) ** 2 / max(self.tau, self.eps)  # [T,M]
+            # target symbol indices from bits (MSB-first)
+            bits_i = bits_full[i, : T * k].view(T, k).to(est_i.device)
+            target_idx = self._bits_to_index(bits_i)
 
-            bit_logits = []
-            for b in range(k):
-                mask1 = bit_labels[:, b] > 0.5
-                mask0 = ~mask1
-                ll1 = torch.logsumexp(ll[:, mask1], dim=1)
-                ll0 = torch.logsumexp(ll[:, mask0], dim=1)
-                bit_logits.append(ll1 - ll0)
-            logits = torch.stack(bit_logits, dim=1)  # [T,k]
-            losses.append(F.binary_cross_entropy_with_logits(logits, tgt_bits))
+            pts = self._constellation_points(mod_i, est_i.device)  # [M]
+            d2 = torch.abs(est_i.unsqueeze(1) - pts.unsqueeze(0)) ** 2  # [T,M]
+            logits = -d2 / self.tau
+            losses.append(F.cross_entropy(logits, target_idx))
 
         if len(losses) == 0:
             return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
         return torch.stack(losses).mean()
 
     def forward(self, target_ri, est_ri, bits_full=None, bits_len=None, modulation=None, sps=None, return_components=False):
-        # IQ loss (time)
+        # raw components
         l_iq = self.complex_mse(target_ri, est_ri)
 
-        target_c_full = torch.view_as_complex(target_ri)  # [B,N,1]
-        est_c_full = torch.view_as_complex(est_ri)
-        total = l_iq
-
-        # Modulation-aware bit BCE via soft demodulation.
-        l_bits = torch.tensor(0.0, device=est_ri.device, dtype=torch.float32)
+        est_c = torch.view_as_complex(est_ri).squeeze(-1)  # [B,N]
+        l_sym = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
         if bits_full is not None and bits_len is not None and modulation is not None and sps is not None:
-            l_bits = self._bit_demod_ce_loss(est_c_full.squeeze(-1), bits_full, bits_len, modulation, sps)
+            l_sym = self._symbol_ce_loss(est_c, bits_full, bits_len, modulation, sps)
 
-        # Symbol EVM loss
-        target_c = target_c_full.squeeze(-1)  # [B,N]
-        est_c = est_c_full.squeeze(-1)  # [B,N]
-        l_evm = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        if sps is not None:
-            l_evm = self._symbol_evm_loss(est_c, target_c, sps)
+        # EMA normalization for stable blending.
+        l_iq_val = float(l_iq.detach().item())
+        l_sym_val = float(l_sym.detach().item())
+        if self.ema_iq is None:
+            self.ema_iq = l_iq_val
+        else:
+            self.ema_iq = self.ema_beta * self.ema_iq + (1.0 - self.ema_beta) * l_iq_val
 
-        a = self.alpha
-        total = (1.0 - a) * l_iq + 0.5 * a * l_bits + 0.5 * a * l_evm
+        if self.ema_sym is None:
+            self.ema_sym = max(l_sym_val, self.eps)
+        else:
+            self.ema_sym = self.ema_beta * self.ema_sym + (1.0 - self.ema_beta) * max(l_sym_val, self.eps)
+
+        l_iq_n = l_iq / (self.ema_iq + self.eps)
+        l_sym_n = l_sym / (self.ema_sym + self.eps)
 
         if return_components:
-            return total, l_iq, l_bits, l_evm
-        return total
+            return l_iq_n, l_sym_n
+        loss = (1.0 - self.alpha) * l_iq_n + self.alpha * l_sym_n
+        return loss
         
 
 class tfdiffLearner:
