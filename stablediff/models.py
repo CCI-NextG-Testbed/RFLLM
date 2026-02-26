@@ -97,8 +97,9 @@ class DiA(nn.Module):
         super().__init__()
         self.norm1 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
+        attn_eps = float(block_kwargs.get("eps", 1e-8))
         self.attn = cm.CosineComplexMultiHeadAttention(
-            hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
+            hidden_dim=hidden_dim, num_heads=num_heads, bias=True, eps=attn_eps)
         self.norm2 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
@@ -185,7 +186,7 @@ class tfdiff_Simple(nn.Module):
         self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim)
 
         # Optional conditioning projection (real -> complex hidden)
-        self.text_encoder = SentenceTransformer("BAAI/bge-large-en-v1.5")
+        self.text_encoder = SentenceTransformer("intfloat/e5-large-v2")
         text_dim = self.text_encoder.get_sentence_embedding_dimension()
         # project real text embedding to complex [B, H, 2]
         self.text_proj = nn.Linear(text_dim, self.hidden_dim * 2)
@@ -263,9 +264,11 @@ class tfdiff_Simple(nn.Module):
     def forward(self, x, t, cond):
         device = x.device
 
-        # cond is dict: {'prompt': label/list[str], 'bits': [B,N]}
+        # cond is dict: {'prompt': label/list[str], 'bits_cond' or 'bits': [B,N]}
         prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
-        bits_input   = cond.get("bits") if isinstance(cond, dict) else None
+        bits_input   = None
+        if isinstance(cond, dict):
+            bits_input = cond.get("bits_cond", cond.get("bits"))
 
         # x expected [B,N,1,2]
         B, N = x.shape[0], x.shape[1]

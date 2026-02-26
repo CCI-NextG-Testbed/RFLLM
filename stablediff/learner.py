@@ -201,6 +201,7 @@ class tfdiffLearner:
         self.snapshot_dir = os.path.join(self.model_dir, "training_snapshots")
         if self.val_dataset is None:
             raise ValueError("A test/validation dataloader is mandatory in this training configuration.")
+        self.prompt_ema = None
 
     def state_dict(self):
         if hasattr(self.model, 'module') and isinstance(self.model.module, nn.Module):
@@ -434,7 +435,7 @@ class tfdiffLearner:
                 cond = {'prompt': prompts, 'bits_cond': bits_cond}
                 predicted = self.diffusion.sampling(self.model, cond, device)
 
-                base_loss, _, _, _ = self.loss_fn(
+                l_iq_n, l_sym_n = self.loss_fn(
                     data,
                     predicted,
                     bits_full=bits_full,
@@ -443,6 +444,10 @@ class tfdiffLearner:
                     sps=sps,
                     return_components=True,
                 )
+                prompt_loss = self._prompt_loss(predicted, prompts)
+                prompt_loss_n = self._normalize_prompt_loss(prompt_loss)
+                alpha = float(getattr(self.loss_fn, "alpha", 0.6))
+                base_loss = (1.0 - alpha) * l_iq_n + 0.5 * alpha * l_sym_n + 0.5 * alpha * prompt_loss_n
 
                 model_ref = self.model.module if hasattr(self.model, "module") else self.model
                 mod_logits = getattr(model_ref, "last_mod_logits", None)
@@ -465,6 +470,40 @@ class tfdiffLearner:
         if loss_count == 0:
             return float("nan")
         return loss_sum / float(loss_count)
+
+    def _prompt_loss(self, predicted, prompts):
+        """
+        Prompt-alignment loss: compare pooled predicted token embedding with text embedding.
+        Keeps text encoder frozen in this term to avoid expensive/unintended updates.
+        """
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        if not hasattr(model_ref, "_encode_text") or not hasattr(model_ref, "p_embed"):
+            return torch.tensor(0.0, device=predicted.device, dtype=torch.float32)
+
+        B = predicted.shape[0]
+        with torch.no_grad():
+            text_c = model_ref._encode_text(prompts, predicted.device)  # [B,H,2]
+            if text_c.shape[0] == 1 and B > 1:
+                text_c = text_c.expand(B, -1, -1)
+            text_flat = text_c.reshape(B, -1).to(torch.float32)
+
+        pred_tok = model_ref.p_embed(predicted)     # [B,N,H,2]
+        pred_pool = pred_tok.mean(dim=1)            # [B,H,2]
+        pred_flat = pred_pool.reshape(B, -1).to(torch.float32)
+
+        text_flat = F.normalize(text_flat, p=2, dim=1, eps=1e-8)
+        pred_flat = F.normalize(pred_flat, p=2, dim=1, eps=1e-8)
+        cos = (text_flat * pred_flat).sum(dim=1)
+        return (1.0 - cos).mean()
+
+    def _normalize_prompt_loss(self, l_prompt):
+        l_val = float(l_prompt.detach().item())
+        if self.prompt_ema is None:
+            self.prompt_ema = max(l_val, 1e-8)
+        else:
+            beta = float(getattr(self.loss_fn, "ema_beta", 0.99))
+            self.prompt_ema = beta * self.prompt_ema + (1.0 - beta) * max(l_val, 1e-8)
+        return l_prompt / (self.prompt_ema + 1e-8)
 
     def _symbol_rate_view(self, x: np.ndarray, sps: int, max_symbols: int):
         T = min(len(x) // sps, max_symbols)
@@ -688,7 +727,7 @@ class tfdiffLearner:
         cond = {'prompt': prompts, 'bits_cond': bits_cond}
         predicted = self.model(degrade_data, t, cond)
 
-        base_loss, _, _, _ = self.loss_fn(
+        l_iq_n, l_sym_n = self.loss_fn(
             data,
             predicted,
             bits_full=bits_full,
@@ -697,6 +736,10 @@ class tfdiffLearner:
             sps=sps,
             return_components=True,
         )
+        prompt_loss = self._prompt_loss(predicted, prompts)
+        prompt_loss_n = self._normalize_prompt_loss(prompt_loss)
+        alpha = float(getattr(self.loss_fn, "alpha", 0.6))
+        base_loss = (1.0 - alpha) * l_iq_n + 0.5 * alpha * l_sym_n + 0.5 * alpha * prompt_loss_n
 
         # Supervise learned prompt->modulation routing head.
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
