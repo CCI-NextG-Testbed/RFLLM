@@ -18,14 +18,10 @@ except Exception:
 
 
 class IQPlusBitsLoss(nn.Module):
-    def __init__(self, alpha=0.6, tau=0.1, ema_beta=0.99, eps=1e-8):
+    def __init__(self, alpha=0.6, eps=1e-8):
         super().__init__()
-        self.alpha = alpha
-        self.tau = tau
-        self.ema_beta = ema_beta
+        self.alpha = float(alpha)
         self.eps = eps
-        self.ema_iq = None
-        self.ema_sym = None
 
     @staticmethod
     def complex_mse(target_ri, est_ri):
@@ -34,144 +30,70 @@ class IQPlusBitsLoss(nn.Module):
         est_c    = torch.view_as_complex(est_ri)
         return torch.mean(torch.abs(target_c - est_c) ** 2)
 
-    @staticmethod
-    def _gray_to_binary_t(x: torch.Tensor) -> torch.Tensor:
-        b = x.clone()
-        shift = 1
-        while shift < 32:
-            b = torch.bitwise_xor(b, torch.bitwise_right_shift(b, shift))
-            shift <<= 1
-        return b
-
-    @staticmethod
-    def _bits_per_symbol(mod: str) -> int:
-        m = str(mod).upper()
-        if m == "BPSK":
-            return 1
-        if m == "QPSK":
-            return 2
-        if m == "8PSK":
-            return 3
-        if m == "16QAM":
-            return 4
-        if m == "64QAM":
-            return 6
-        if m == "256QAM":
-            return 8
-        return 1
-
-    def _constellation_points(self, mod: str, device):
-        m = str(mod).upper()
-        if m == "BPSK":
-            return torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
-
-        if m == "QPSK":
-            return torch.tensor(
-                [-1.0 - 1.0j, -1.0 + 1.0j, 1.0 - 1.0j, 1.0 + 1.0j],
-                dtype=torch.complex64,
-                device=device,
-            ) / np.sqrt(2.0)
-
-        if m == "8PSK":
-            g = torch.arange(8, dtype=torch.int64, device=device)
-            idx = self._gray_to_binary_t(g)
-            phase = 2.0 * torch.pi * idx.to(torch.float32) / 8.0
-            return torch.exp(1j * phase).to(torch.complex64)
-
-        if m in ("16QAM", "64QAM", "256QAM"):
-            M = int(m.replace("QAM", ""))
-            k = int(np.log2(M))
-            k2 = k // 2
-            vals = torch.arange(M, dtype=torch.int64, device=device)
-
-            shifts = torch.arange(k - 1, -1, -1, device=device, dtype=torch.int64)
-            bits = ((vals.unsqueeze(1) >> shifts.unsqueeze(0)) & 1).to(torch.int64)  # [M,k]
-
-            w = (2 ** torch.arange(k2 - 1, -1, -1, device=device, dtype=torch.int64))
-            gI = (bits[:, :k2] * w.unsqueeze(0)).sum(dim=1)
-            gQ = (bits[:, k2:] * w.unsqueeze(0)).sum(dim=1)
-            bI = self._gray_to_binary_t(gI)
-            bQ = self._gray_to_binary_t(gQ)
-
-            L = int(np.sqrt(M))
-            aI = (2.0 * bI.to(torch.float32) - (L - 1)).to(torch.float32)
-            aQ = (2.0 * bQ.to(torch.float32) - (L - 1)).to(torch.float32)
-            pts = (aI + 1j * aQ).to(torch.complex64)
-            p = torch.mean(torch.abs(pts) ** 2).clamp(min=self.eps)
-            return pts / torch.sqrt(p)
-
-        # fallback
-        return torch.tensor([-1.0 + 0.0j, 1.0 + 0.0j], dtype=torch.complex64, device=device)
-
-    @staticmethod
-    def _bits_to_index(bits: torch.Tensor) -> torch.Tensor:
-        # bits: [T,k] with MSB-first
-        k = bits.shape[1]
-        w = (2 ** torch.arange(k - 1, -1, -1, device=bits.device, dtype=torch.float32))
-        return torch.sum(bits * w.unsqueeze(0), dim=1).long()
-
-    def _symbol_ce_loss(self, est_c, bits_full, bits_len, modulation, sps):
-        # est_c: [B,N] complex
+    def _symbol_evm_loss(self, est_c, target_c, sps):
+        # est_c, target_c: [B,N] complex
         B, N = est_c.shape
         losses = []
         for i in range(B):
-            mod_i = modulation[i]
-            k = self._bits_per_symbol(mod_i)
-            Li = int(bits_len[i].item())
-            Ti = Li // k
-            if Ti <= 0:
-                continue
-
             sps_i = max(1, int(sps[i].item()))
-            pred_sym = N // sps_i
-            T = min(Ti, pred_sym)
+            T = N // sps_i
             if T <= 0:
                 continue
 
-            # predicted symbols at symbol-rate
             est_i = est_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
+            tgt_i = target_c[i, :T * sps_i].view(T, sps_i).mean(dim=1)  # [T]
 
-            # target symbol indices from bits (MSB-first)
-            bits_i = bits_full[i, : T * k].view(T, k).to(est_i.device)
-            target_idx = self._bits_to_index(bits_i)
-
-            pts = self._constellation_points(mod_i, est_i.device)  # [M]
-            d2 = torch.abs(est_i.unsqueeze(1) - pts.unsqueeze(0)) ** 2  # [T,M]
-            logits = -d2 / self.tau
-            losses.append(F.cross_entropy(logits, target_idx))
+            if rfml_evm is not None:
+                est_ri = torch.stack((est_i.real, est_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
+                tgt_ri = torch.stack((tgt_i.real, tgt_i.imag), dim=0).unsqueeze(0).unsqueeze(0)  # [1,1,2,T]
+                losses.append(torch.mean(rfml_evm(est_ri, tgt_ri)))
+            else:
+                num = torch.mean(torch.abs(est_i - tgt_i) ** 2)
+                den = torch.mean(torch.abs(tgt_i) ** 2).clamp(min=self.eps)
+                losses.append(torch.sqrt(num / den))
 
         if len(losses) == 0:
             return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
         return torch.stack(losses).mean()
 
-    def forward(self, target_ri, est_ri, bits_full=None, bits_len=None, modulation=None, sps=None, return_components=False):
-        # raw components
+    @staticmethod
+    def _prepare_bits_target(bits, B, N, device):
+        if bits is None:
+            return None
+        b = bits.to(device).float()
+        if b.dim() > 2:
+            b = b.reshape(b.shape[0], -1)
+        if b.dim() != 2 or b.shape[0] != B:
+            return None
+        if b.shape[1] < N:
+            b = F.pad(b, (0, N - b.shape[1]))
+        elif b.shape[1] > N:
+            b = b[:, :N]
+        return b
+
+    def forward(self, target_ri, est_ri, bits=None, sps=None, return_components=False):
         l_iq = self.complex_mse(target_ri, est_ri)
 
-        est_c = torch.view_as_complex(est_ri).squeeze(-1)  # [B,N]
-        l_sym = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
-        if bits_full is not None and bits_len is not None and modulation is not None and sps is not None:
-            l_sym = self._symbol_ce_loss(est_c, bits_full, bits_len, modulation, sps)
+        B = est_ri.shape[0]
+        N = est_ri.shape[1]
 
-        # EMA normalization for stable blending.
-        l_iq_val = float(l_iq.detach().item())
-        l_sym_val = float(l_sym.detach().item())
-        if self.ema_iq is None:
-            self.ema_iq = l_iq_val
-        else:
-            self.ema_iq = self.ema_beta * self.ema_iq + (1.0 - self.ema_beta) * l_iq_val
+        l_bits = torch.tensor(0.0, device=est_ri.device, dtype=torch.float32)
+        bits_tgt = self._prepare_bits_target(bits, B, N, est_ri.device)
+        if bits_tgt is not None:
+            logits = est_ri[..., 0].squeeze(-1)  # [B,N] real path logits
+            l_bits = F.binary_cross_entropy_with_logits(logits, bits_tgt)
 
-        if self.ema_sym is None:
-            self.ema_sym = max(l_sym_val, self.eps)
-        else:
-            self.ema_sym = self.ema_beta * self.ema_sym + (1.0 - self.ema_beta) * max(l_sym_val, self.eps)
-
-        l_iq_n = l_iq / (self.ema_iq + self.eps)
-        l_sym_n = l_sym / (self.ema_sym + self.eps)
+        target_c = torch.view_as_complex(target_ri).squeeze(-1)  # [B,N]
+        est_c = torch.view_as_complex(est_ri).squeeze(-1)        # [B,N]
+        l_evm = torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
+        if sps is not None:
+            l_evm = self._symbol_evm_loss(est_c, target_c, sps)
 
         if return_components:
-            return l_iq_n, l_sym_n
-        loss = (1.0 - self.alpha) * l_iq_n + self.alpha * l_sym_n
+            return l_iq, l_bits, l_evm
+
+        a = self.alpha
+        loss = (1.0 - a) * l_iq + 0.5 * a * l_bits + 0.5 * a * l_evm
         return loss
         
 
@@ -194,14 +116,12 @@ class tfdiffLearner:
         self.is_master = True
         self.loss_fn = IQPlusBitsLoss(
             alpha=float(getattr(params, "loss_alpha", 0.6)),
-            tau=float(getattr(params, "symbol_tau", 0.1)),
         )
         self.summary_writer = None
         self.epoch_history = []
         self.snapshot_dir = os.path.join(self.model_dir, "training_snapshots")
         if self.val_dataset is None:
             raise ValueError("A test/validation dataloader is mandatory in this training configuration.")
-        self.prompt_ema = None
 
     def state_dict(self):
         if hasattr(self.model, 'module') and isinstance(self.model.module, nn.Module):
@@ -435,19 +355,13 @@ class tfdiffLearner:
                 cond = {'prompt': prompts, 'bits_cond': bits_cond}
                 predicted = self.diffusion.sampling(self.model, cond, device)
 
-                l_iq_n, l_sym_n = self.loss_fn(
+                bits_for_loss = features.get('bits_cond', features.get('bits', None))
+                base_loss = self.loss_fn(
                     data,
                     predicted,
-                    bits_full=bits_full,
-                    bits_len=bits_len,
-                    modulation=modulation,
+                    bits=bits_for_loss,
                     sps=sps,
-                    return_components=True,
                 )
-                prompt_loss = self._prompt_loss(predicted, prompts)
-                prompt_loss_n = self._normalize_prompt_loss(prompt_loss)
-                alpha = float(getattr(self.loss_fn, "alpha", 0.6))
-                base_loss = (1.0 - alpha) * l_iq_n + 0.5 * alpha * l_sym_n + 0.5 * alpha * prompt_loss_n
 
                 model_ref = self.model.module if hasattr(self.model, "module") else self.model
                 mod_logits = getattr(model_ref, "last_mod_logits", None)
@@ -470,40 +384,6 @@ class tfdiffLearner:
         if loss_count == 0:
             return float("nan")
         return loss_sum / float(loss_count)
-
-    def _prompt_loss(self, predicted, prompts):
-        """
-        Prompt-alignment loss: compare pooled predicted token embedding with text embedding.
-        Keeps text encoder frozen in this term to avoid expensive/unintended updates.
-        """
-        model_ref = self.model.module if hasattr(self.model, "module") else self.model
-        if not hasattr(model_ref, "_encode_text") or not hasattr(model_ref, "p_embed"):
-            return torch.tensor(0.0, device=predicted.device, dtype=torch.float32)
-
-        B = predicted.shape[0]
-        with torch.no_grad():
-            text_c = model_ref._encode_text(prompts, predicted.device)  # [B,H,2]
-            if text_c.shape[0] == 1 and B > 1:
-                text_c = text_c.expand(B, -1, -1)
-            text_flat = text_c.reshape(B, -1).to(torch.float32)
-
-        pred_tok = model_ref.p_embed(predicted)     # [B,N,H,2]
-        pred_pool = pred_tok.mean(dim=1)            # [B,H,2]
-        pred_flat = pred_pool.reshape(B, -1).to(torch.float32)
-
-        text_flat = F.normalize(text_flat, p=2, dim=1, eps=1e-8)
-        pred_flat = F.normalize(pred_flat, p=2, dim=1, eps=1e-8)
-        cos = (text_flat * pred_flat).sum(dim=1)
-        return (1.0 - cos).mean()
-
-    def _normalize_prompt_loss(self, l_prompt):
-        l_val = float(l_prompt.detach().item())
-        if self.prompt_ema is None:
-            self.prompt_ema = max(l_val, 1e-8)
-        else:
-            beta = float(getattr(self.loss_fn, "ema_beta", 0.99))
-            self.prompt_ema = beta * self.prompt_ema + (1.0 - beta) * max(l_val, 1e-8)
-        return l_prompt / (self.prompt_ema + 1e-8)
 
     def _symbol_rate_view(self, x: np.ndarray, sps: int, max_symbols: int):
         T = min(len(x) // sps, max_symbols)
@@ -727,19 +607,13 @@ class tfdiffLearner:
         cond = {'prompt': prompts, 'bits_cond': bits_cond}
         predicted = self.model(degrade_data, t, cond)
 
-        l_iq_n, l_sym_n = self.loss_fn(
+        bits_for_loss = features.get('bits_cond', features.get('bits', None))
+        base_loss = self.loss_fn(
             data,
             predicted,
-            bits_full=bits_full,
-            bits_len=bits_len,
-            modulation=modulation,
+            bits=bits_for_loss,
             sps=sps,
-            return_components=True,
         )
-        prompt_loss = self._prompt_loss(predicted, prompts)
-        prompt_loss_n = self._normalize_prompt_loss(prompt_loss)
-        alpha = float(getattr(self.loss_fn, "alpha", 0.6))
-        base_loss = (1.0 - alpha) * l_iq_n + 0.5 * alpha * l_sym_n + 0.5 * alpha * prompt_loss_n
 
         # Supervise learned prompt->modulation routing head.
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
