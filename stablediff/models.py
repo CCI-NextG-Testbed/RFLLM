@@ -121,7 +121,6 @@ class DiA(nn.Module):
         Embedding condition c with cross-attention.
         - Input:\\
           x, [B, N, H, 2], \\ 
-          t, [B, H, 2], \\
           c, [B, N, H, 2], \\
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(

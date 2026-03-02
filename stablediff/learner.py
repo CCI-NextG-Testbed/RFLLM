@@ -122,6 +122,7 @@ class IQPlusBitsLoss(nn.Module):
             if Ti <= 0:
                 continue
 
+
             sps_i = max(1, int(sps[i].item()))
             pred_sym = N // sps_i
             T = min(Ti, pred_sym)
