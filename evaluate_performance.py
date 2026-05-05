@@ -178,6 +178,36 @@ def add_awgn(sym: np.ndarray, ebn0_db: float, k: int, rng: np.random.Generator) 
 
 
 # ==========================================================
+# Plotting
+# ==========================================================
+
+def plot_ber_curve(rows, title: str, ymin: float) -> None:
+    import matplotlib.pyplot as plt
+
+    ebn0 = np.asarray([r[0] for r in rows], dtype=np.float64)
+    ber = np.asarray([r[1] for r in rows], dtype=np.float64)
+    ber_std = np.asarray([r[4] for r in rows], dtype=np.float64)
+
+    plot_ber = np.maximum(ber, ymin)
+    lower = np.maximum(ber - ber_std, ymin)
+    upper = np.maximum(ber + ber_std, ymin)
+
+    fig, ax = plt.subplots(figsize=(8, 5.2))
+    ax.semilogy(ebn0, plot_ber, marker="o", linewidth=2.0, label="Average BER")
+    if np.any(ber_std > 0):
+        ax.fill_between(ebn0, lower, upper, alpha=0.18, label="+/- 1 std")
+
+    ax.set_xlabel("Eb/N0 (dB)")
+    ax.set_ylabel("BER")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.set_ylim(bottom=ymin, top=1.0)
+    ax.legend()
+    fig.tight_layout()
+    plt.show()
+
+
+# ==========================================================
 # MAIN
 # ==========================================================
 
@@ -189,10 +219,23 @@ def main():
     ap.add_argument("--ebn0_start", type=float, default=-5.0)
     ap.add_argument("--ebn0_stop", type=float, default=20.0)
     ap.add_argument("--ebn0_step", type=float, default=1.0)
+    ap.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="independent AWGN trials to average at each Eb/N0 point",
+    )
     ap.add_argument("--csv", default="ber.csv")
+    ap.add_argument("--no_plot", action="store_true", help="skip BER plot generation")
+    ap.add_argument("--plot_ymin", type=float, default=1e-5, help="minimum BER shown on the log plot")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mat_var", default=None)
     args = ap.parse_args()
+
+    if args.runs < 1:
+        raise ValueError("--runs must be >= 1")
+    if args.plot_ymin <= 0:
+        raise ValueError("--plot_ymin must be > 0")
 
     rng = np.random.default_rng(args.seed)
 
@@ -235,23 +278,43 @@ def main():
     ebn0_vals = np.arange(args.ebn0_start, args.ebn0_stop + 1e-9, args.ebn0_step, dtype=np.float64)
 
     for ebn0_db in ebn0_vals:
-        y = add_awgn(sym, float(ebn0_db), k=k, rng=rng)
-        bh = demod(y).astype(np.uint8)
+        total_err = 0
+        total_bits = 0
+        ber_trials = []
 
-        L = min(bh.size, bits.size)
-        err = int(np.count_nonzero((bh[:L] ^ bits[:L]) & 1))
-        ber = err / float(L) if L > 0 else 1.0
+        for _ in range(args.runs):
+            y = add_awgn(sym, float(ebn0_db), k=k, rng=rng)
+            bh = demod(y).astype(np.uint8)
 
-        print(f"Eb/N0={ebn0_db:6.2f} dB  BER={ber:.6e}  (errors={err}, Nbits={L})")
-        rows.append((float(ebn0_db), float(ber), int(L), int(err)))
+            L = min(bh.size, bits.size)
+            err = int(np.count_nonzero((bh[:L] ^ bits[:L]) & 1))
+            ber_trials.append(err / float(L) if L > 0 else 1.0)
+            total_err += err
+            total_bits += int(L)
+
+        ber = total_err / float(total_bits) if total_bits > 0 else 1.0
+        ber_std = float(np.std(ber_trials, ddof=1)) if len(ber_trials) > 1 else 0.0
+
+        print(
+            f"Eb/N0={ebn0_db:6.2f} dB  BER={ber:.6e}  "
+            f"(runs={args.runs}, errors={total_err}, Nbits={total_bits}, std={ber_std:.6e})"
+        )
+        rows.append((float(ebn0_db), float(ber), int(total_bits), int(total_err), ber_std))
 
     with open(args.csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ebn0_db", "ber"])
+        w.writerow(["ebn0_db", "ber", "runs", "n_bits", "errors", "ber_std"])
         for r in rows:
-            w.writerow([f"{r[0]:.6f}", f"{r[1]:.10e}"])
+            w.writerow([f"{r[0]:.6f}", f"{r[1]:.10e}", args.runs, r[2], r[3], f"{r[4]:.10e}"])
 
     print("Saved:", args.csv)
+
+    if not args.no_plot:
+        plot_ber_curve(
+            rows,
+            title=f"{mod} BER vs Eb/N0 ({args.runs} run{'s' if args.runs != 1 else ''}/point)",
+            ymin=float(args.plot_ymin),
+        )
 
 
 if __name__ == "__main__":

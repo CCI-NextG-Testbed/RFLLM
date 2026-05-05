@@ -53,6 +53,16 @@ def main(args):
         params.animate_after_training = True
     if args.animation_out is not None:
         params.training_animation_out = args.animation_out
+    if args.use_tfdiff_loss:
+        params.use_tfdiff_loss = True
+    if args.loss_w_fft is not None:
+        params.loss_w_fft = args.loss_w_fft
+    if args.loss_w_time is not None:
+        params.loss_w_time = args.loss_w_time
+    if args.learning_rate is not None:
+        params.learning_rate = args.learning_rate
+    if args.training_metrics_csv is not None:
+        params.training_metrics_csv = args.training_metrics_csv
     params.test_per_mod = args.test_per_mod
     params.test_mods = args.test_mods
     params.split_seed = args.split_seed
@@ -76,9 +86,19 @@ if __name__ == '__main__':
                         help='generate training animation automatically when training ends')
     parser.add_argument('--animation_out', default=None,
                         help='output path for training animation (.gif or .mp4)')
+    parser.add_argument('--use_tfdiff_loss', action='store_true',
+                        help='use tfdiffLoss instead of IQPlusBitsLoss')
+    parser.add_argument('--loss_w_fft', default=None, type=float,
+                        help='weight for the noise term in tfdiffLoss')
+    parser.add_argument('--loss_w_time', default=None, type=float,
+                        help='weight for L_time in IQPlusBitsLoss; L_evm is derived as 1 - loss_w_time')
+    parser.add_argument('--learning_rate', default=None, type=float,
+                        help='optimizer learning rate override')
+    parser.add_argument('--training_metrics_csv', default=None,
+                        help='output CSV path for per-epoch convergence tracking')
     parser.add_argument('--test_per_mod', default=1, type=int,
                         help='number of held-out test samples per modulation')
-    parser.add_argument('--test_mods', default=['BPSK', 'QPSK', '8PSK'], nargs='+',
+    parser.add_argument('--test_mods', default=['BPSK', 'QPSK', '8PSK', '16QAM'], nargs='+',
                         help='modulations to hold out for the test set')
     parser.add_argument('--split_seed', default=42, type=int,
                         help='random seed used for train/test holdout selection')

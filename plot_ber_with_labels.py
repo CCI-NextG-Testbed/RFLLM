@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
+import re
+from typing import Optional
 
 import pandas as pd
 import numpy as np
@@ -24,6 +26,43 @@ def aggregate_df(df: pd.DataFrame, how: str) -> pd.DataFrame:
     if how == "median":
         return df.groupby("snr_db", as_index=False)["ber"].median()
     raise ValueError("Unknown aggregate mode")
+
+
+def infer_line_style(label: str, path: str) -> str:
+    series_name = f"{label} {Path(path).stem}".lower()
+    if any(token in series_name for token in ("pred", "prediction", "predicted")):
+        return ":"
+    return "-"
+
+
+def infer_marker(label: str, path: str) -> Optional[str]:
+    return None
+
+
+def infer_modulation_family(label: str, path: str) -> str:
+    series_name = f"{label} {Path(path).stem}".lower()
+    compact_name = re.sub(r"[^a-z0-9]+", "", series_name)
+    match = re.search(r"(\d+qam|\d+psk|bpsk|qpsk|\d+pam|\d+fsk|ook)", compact_name)
+    if match:
+        return match.group(1)
+
+    cleanup_tokens = {
+        "ber",
+        "gt",
+        "ground",
+        "truth",
+        "pred",
+        "prediction",
+        "predicted",
+        "snr",
+        "vs",
+    }
+    tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", series_name)
+        if token and token not in cleanup_tokens
+    ]
+    return tokens[0] if tokens else compact_name
 
 
 def main():
@@ -84,6 +123,8 @@ def main():
     plt.figure()
 
     xmins = []
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors_by_family = {}
 
     for path, label in zip(csv_paths, labels):
         df = load_one_csv(path, args.snr_col, args.ber_col)
@@ -102,12 +143,16 @@ def main():
             continue
 
         xmins.append(float(df_plot["snr_db"].min()))
+        family = infer_modulation_family(label, path)
+        if family not in colors_by_family:
+            colors_by_family[family] = color_cycle[len(colors_by_family) % len(color_cycle)]
 
         plt.semilogy(
             df_plot["snr_db"],
             df_plot["ber"],
-            marker="o",
-            linestyle="-",
+            color=colors_by_family[family],
+            marker=infer_marker(label, path),
+            linestyle=infer_line_style(label, path),
             label=label,
         )
 
@@ -119,7 +164,7 @@ def main():
     plt.xlim(min(xmins), args.xmax)
     plt.ylim(args.ymin, args.ymax)
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    plt.title("BER vs SNR (E5-Large Attention Block Study)")
+    plt.title("BER vs SNR Comparison")
     plt.legend()
 
     if args.out:

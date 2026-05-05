@@ -148,7 +148,6 @@ class SignalDiffusion(nn.Module):
                 t_prev = (s - 1) * torch.ones(batch_size, dtype=torch.int64, device=device)
                 x_s = self.degrade_fn(x_0_hat, t_prev)
 
-        x_0_hat = rms_norm(x_0_hat, target_rms=1.0)
         return x_0_hat
 
 

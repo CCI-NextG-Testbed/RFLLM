@@ -98,7 +98,9 @@ class DiA(nn.Module):
         self.norm1 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
         attn_eps = float(block_kwargs.get("eps", 1e-8))
-        self.attn = cm.CosineComplexMultiHeadAttention(
+        #self.attn = cm.CosineComplexMultiHeadAttention(
+        #    hidden_dim, num_heads, bias=True, eps=attn_eps)
+        self.attn = cm.ComplexMultiHeadAttention(
             hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
         self.norm2 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
@@ -121,7 +123,6 @@ class DiA(nn.Module):
         Embedding condition c with cross-attention.
         - Input:\\
           x, [B, N, H, 2], \\ 
-          t, [B, H, 2], \\
           c, [B, N, H, 2], \\
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(

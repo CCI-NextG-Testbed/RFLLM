@@ -14,6 +14,27 @@ def apply_complex_sep(F_r, F_i, X):
     X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
     return torch.stack((F_r(X_r), F_i(X_i)), dim=-1)
 
+def _split_heads_complex(x, num_heads):
+    """
+    x: [B, S, hidden_dim, 2]
+    returns: [B, H, S, head_dim, 2]
+    """
+    B, S, D, two = x.shape
+    assert two == 2
+    assert D % num_heads == 0
+    hd = D // num_heads
+    return x.view(B, S, num_heads, hd, 2).permute(0, 2, 1, 3, 4).contiguous()
+
+
+def _merge_heads_complex(x):
+    """
+    x: [B, H, S, head_dim, 2]
+    returns: [B, S, hidden_dim, 2]
+    """
+    B, H, S, hd, two = x.shape
+    assert two == 2
+    return x.permute(0, 2, 1, 3, 4).contiguous().view(B, S, H * hd, 2)
+
 @torch.jit.script
 def complex_mul(X, Y):
     X_r, X_i = [x.squeeze(dim=-1) for x in torch.split(X, 1, dim=-1)]
@@ -280,63 +301,6 @@ class ComplexDotProductAttention(nn.Module):
         Y = complex_bmm(self.dropout(self.attention_weights), values)
         return Y
 
-class LinearComplexAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout=0.0, bias=True, eps=1e-6):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.eps = eps
-
-        self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
-        self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
-        self.w_v = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
-        self.w_o = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
-
-        self.drop = ComplexDropout(dropout) if dropout and dropout > 0 else nn.Identity()
-
-    @staticmethod
-    def _phi(x):
-        """
-        Positive feature map phi(x): apply ELU+1 to real and imag separately.
-        x: [..., 2]
-        """
-        xr, xi = [t.squeeze(-1) for t in torch.split(x, 1, dim=-1)]
-        return torch.stack((F.elu(xr) + 1.0, F.elu(xi) + 1.0), dim=-1)
-
-    def forward(self, q, k, v):
-        # Project
-        q = self.w_q(q)  # [B,N,H,2]
-        k = self.w_k(k)
-        v = self.w_v(v)
-
-        qh = transpose_qkv(q, self.num_heads)
-        kh = transpose_qkv(k, self.num_heads)
-        vh = transpose_qkv(v, self.num_heads)
-
-        qf = self._phi(qh) 
-        kf = self._phi(kh)  
-
-        kf_T = kf.transpose(1, 2).contiguous()
-        KV = complex_bmm(kf_T, vh)  # [Bh, D, D,2]
-
-        # out = qf @ KV: [Bh, N, D,2]
-        out = complex_bmm(qf, KV)
-
-        ones = torch.zeros_like(vh)
-        ones[..., 0] = 1.0
-        K1 = complex_bmm(kf_T, ones)      # [Bh, D, D,2]
-        denom_c = complex_bmm(qf, K1)     # [Bh, N, D,2]
-
-        denom = denom_c[..., 0].clamp(min=self.eps)  # [Bh,N,D]
-        out = out / denom.unsqueeze(-1)              # broadcast over complex dim
-
-        out = self.drop(out)
-
-        out = transpose_output(out, self.num_heads)
-        out = self.w_o(out)
-        return out
-
 class ComplexMultiHeadAttention(nn.Module):
     def __init__(
         self,
@@ -384,28 +348,6 @@ class AttnMul(torch.autograd.Function):
         grad_V = ((grad_output.unsqueeze(-1) * Q.unsqueeze(-2))
                   .flip(-3).cumsum(-3).flip(-3) * K.unsqueeze(-2)).sum(-1)
         return grad_Q, grad_K, grad_V
-
-
-def _split_heads_complex(x, num_heads):
-    """
-    x: [B, S, hidden_dim, 2]
-    returns: [B, H, S, head_dim, 2]
-    """
-    B, S, D, two = x.shape
-    assert two == 2
-    assert D % num_heads == 0
-    hd = D // num_heads
-    return x.view(B, S, num_heads, hd, 2).permute(0, 2, 1, 3, 4).contiguous()
-
-
-def _merge_heads_complex(x):
-    """
-    x: [B, H, S, head_dim, 2]
-    returns: [B, S, hidden_dim, 2]
-    """
-    B, H, S, hd, two = x.shape
-    assert two == 2
-    return x.permute(0, 2, 1, 3, 4).contiguous().view(B, S, H * hd, 2)
 
 class CosineAttentionCausal(nn.Module):
     def __init__(self, num_heads, eps=1e-8):

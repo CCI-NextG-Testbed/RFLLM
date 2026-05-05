@@ -245,14 +245,6 @@ class Collator:
             x_c = x_c.view(N, 1)
             x_ri = torch.view_as_real(x_c).to(torch.float32)  # [N,1,2]
 
-            # normalize per-example (optional)
-            if self.normalize:
-                mean = x_ri.mean()
-                std = x_ri.std(unbiased=False)
-                if std < 1e-8:
-                    std = torch.tensor(1.0, device=x_ri.device)
-                x_ri = (x_ri - mean) / std
-
             data_list.append(x_ri)
 
             # ---------- prompt ----------
@@ -375,7 +367,7 @@ def from_path_modulation_holdout(params, test_per_mod=1, mods=("BPSK", "QPSK", "
     rng = random.Random(int(split_seed))
 
     mods = [str(m).upper() for m in mods]
-    mod_to_indices = {m: [] for m in mods}
+    mod_to_indices = {}
 
     for idx in range(len(dataset.filenames)):
         cur_filename = dataset.filenames[idx]
@@ -386,8 +378,7 @@ def from_path_modulation_holdout(params, test_per_mod=1, mods=("BPSK", "QPSK", "
         else:
             label = SimpleSignalDataset._mat_to_str(cur_sample.get("label", ""))
             modulation = SimpleSignalDataset._parse_modulation(label, cur_filename)
-        if modulation in mod_to_indices:
-            mod_to_indices[modulation].append(idx)
+        mod_to_indices.setdefault(modulation, []).append(idx)
 
     test_indices = []
     for m in mods:
@@ -425,6 +416,14 @@ def from_path_modulation_holdout(params, test_per_mod=1, mods=("BPSK", "QPSK", "
         drop_last=False,
         persistent_workers=False,
     )
+    train_loader.sample_count = len(train_ds)
+    test_loader.sample_count = len(test_ds)
+    train_loader.modulation_counts = {
+        mod: len([i for i in idxs if i not in test_set]) for mod, idxs in mod_to_indices.items()
+    }
+    test_loader.modulation_counts = {
+        mod: len([i for i in idxs if i in test_set]) for mod, idxs in mod_to_indices.items()
+    }
     return train_loader, test_loader
 
 

@@ -19,6 +19,64 @@ MOD_TO_ID = {m: i for i, m in enumerate(SUPPORTED_MODS)}
 ID_TO_MOD = {i: m for m, i in MOD_TO_ID.items()}
 
 
+def _normalize_mod_name(txt: str) -> str:
+    return str(txt).upper().replace("-", "").replace(" ", "")
+
+
+def _prompt_respects_modulation(prompt: str, modulation_hint: str) -> bool:
+    if not modulation_hint:
+        return True
+    prompt_norm = _normalize_mod_name(prompt)
+    hint_norm = _normalize_mod_name(modulation_hint)
+    if hint_norm not in prompt_norm:
+        return False
+    for mod in SUPPORTED_MODS:
+        mod_norm = _normalize_mod_name(mod)
+        if mod_norm != hint_norm and mod_norm in prompt_norm:
+            return False
+    return True
+
+
+def infer_modulation_from_text(text: str) -> str:
+    text_norm = _normalize_mod_name(text)
+    for mod in SUPPORTED_MODS:
+        if _normalize_mod_name(mod) in text_norm:
+            return mod
+    return ""
+
+
+def _mod_order(modulation: str) -> int:
+    m = _normalize_mod_name(modulation)
+    if m == "BPSK":
+        return 2
+    if m == "QPSK":
+        return 4
+    if m == "8PSK":
+        return 8
+    if m == "16QAM":
+        return 16
+    if m == "64QAM":
+        return 64
+    if m == "256QAM":
+        return 256
+    return 2
+
+
+def _bits_per_symbol(modulation: str) -> int:
+    M = _mod_order(modulation)
+    return int(np.log2(M))
+
+
+def _bits_to_symbol_index(bits: np.ndarray, k: int) -> np.ndarray:
+    bits = np.asarray(bits).reshape(-1)
+    if k <= 0 or bits.size < k:
+        return np.zeros((0,), dtype=np.float32)
+    T = bits.size // k
+    bb = bits[: T * k].reshape(T, k).astype(np.int64)
+    w = (2 ** np.arange(k - 1, -1, -1)).astype(np.int64)
+    return (bb * w[None, :]).sum(axis=1).astype(np.float32)
+
+
 def mat_to_prompt_str(v) -> str:
     if isinstance(v, str):
         return v
@@ -60,11 +118,28 @@ def load_cond_from_mat(mat_path: str, prompt_key="prompt", bits_key="bits"):
     return prompt, bits
 
 
-def build_bits_cond(bits: np.ndarray, N: int) -> np.ndarray:
+def build_bits_cond(bits: np.ndarray, N: int, modulation: str = "", sps: int = 1) -> np.ndarray:
     bits = np.asarray(bits).reshape(-1)
     bits = (bits != 0).astype(np.float32)
     if bits.size == 0:
         return np.zeros((N,), dtype=np.float32)
+
+    modulation = str(modulation or "").upper()
+    if modulation in SUPPORTED_MODS:
+        k = _bits_per_symbol(modulation)
+        M = _mod_order(modulation)
+        sym_idx = _bits_to_symbol_index(bits, k)
+        if sym_idx.size == 0:
+            return np.zeros((N,), dtype=np.float32)
+        if M > 1:
+            sym_idx = sym_idx / float(M - 1)
+        bits_cond = np.repeat(sym_idx, max(1, int(sps))).astype(np.float32)
+        if bits_cond.size < N:
+            bits_cond = np.pad(bits_cond, (0, N - bits_cond.size), mode="constant")
+        elif bits_cond.size > N:
+            bits_cond = bits_cond[:N]
+        return bits_cond
+
     if bits.size == N:
         return bits.astype(np.float32, copy=False)
     idx = np.floor(np.linspace(0, bits.size - 1, N)).astype(np.int64)
@@ -123,21 +198,106 @@ def maybe_load_rag(enable_rag: bool, chunks_folder: str):
         return None, None
 
 
-def build_rag_query(style: str) -> str:
+def maybe_load_similarity_model(enable_similarity: bool):
+    if not enable_similarity:
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception:
+        return None
+
+
+def semantic_similarity(text_a: str, text_b: str, model) -> float:
+    if model is None:
+        return float("nan")
+    emb = model.encode([str(text_a), str(text_b)], convert_to_numpy=True, normalize_embeddings=True)
+    return float(np.dot(emb[0], emb[1]))
+
+
+def _signal_params_dict(args, params, modulation_hint: str = "") -> dict:
+    return {
+        "modulation": modulation_hint or "",
+        "number_of_samples": int(args.num_samples) if args.num_samples is not None else int(params.sample_rate),
+        "sampling_rate_hz": float(args.sampling_freq_hz),
+        "amplitude": float(args.amplitude),
+        "center_frequency_hz": float(args.center_freq_hz),
+        "phase_degrees": float(args.phase_deg),
+        "samples_per_symbol": int(args.samples_per_symbol),
+    }
+
+
+def _signal_params_text(signal_params: dict) -> str:
+    return (
+        f"Number of samples: {signal_params['number_of_samples']}; "
+        f"Sampling rate: {signal_params['sampling_rate_hz']} Hz; "
+        f"Amplitude: {signal_params['amplitude']}; "
+        f"Center frequency: {signal_params['center_frequency_hz']} Hz; "
+        f"Initial phase: {signal_params['phase_degrees']} degrees; "
+        f"Samples per symbol: {signal_params['samples_per_symbol']}."
+    )
+
+
+def _signal_config_line(signal_params: dict) -> str:
+    return (
+        f"Modulation={signal_params['modulation']}; "
+        f"N={signal_params['number_of_samples']}; "
+        f"sampling_rate_hz={signal_params['sampling_rate_hz']}; "
+        f"samples_per_symbol={signal_params['samples_per_symbol']}; "
+        f"amplitude={signal_params['amplitude']}; "
+        f"center_frequency_hz={signal_params['center_frequency_hz']}; "
+        f"initial_phase_deg={signal_params['phase_degrees']}."
+    )
+
+
+def build_rag_query(style: str, modulation_hint: str = "", signal_params: dict = None) -> str:
     style_hint = {
         "dumb": "simple beginner explanation",
         "vague": "high-level robust communication guidance",
         "advanced": "technical symbol-level and BER/SNR explanation",
     }.get(style, "general explanation")
+    params_text = _signal_params_text(signal_params) if signal_params is not None else ""
+    if modulation_hint:
+        return (
+            f"Digital modulation in complex baseband IQ for {modulation_hint}. "
+            f"Need {style_hint}. Restrict the discussion to {modulation_hint} only. "
+            f"Include {modulation_hint} constellation behavior, symbol mapping, "
+            f"time-domain appearance, and BER/SNR tradeoffs. "
+            f"Use these authoritative signal parameters: {params_text} "
+            f"Do not discuss other modulations or invent different parameter values."
+        )
     return (
         "Digital modulation in complex baseband IQ. "
         f"Need {style_hint}. Include constellation behavior, symbol mapping, "
-        f"time-domain appearance, and BER/SNR tradeoffs."
+        f"time-domain appearance, and BER/SNR tradeoffs. "
+        f"Use these authoritative signal parameters: {params_text}"
     )
 
 
-def generate_prompt(style: str, llm=None, rag_context: str = "", modulation_hint: str = "") -> str:
+def generate_prompt(style: str, llm=None, rag_context: str = "", modulation_hint: str = "", signal_params: dict = None) -> str:
     style = style.lower().strip()
+    params_text = _signal_params_text(signal_params) if signal_params is not None else ""
+
+    def fallback_prompt() -> str:
+        if style == "dumb":
+            return "Write me a short poem about a potato."
+        if style == "vague":
+            if modulation_hint:
+                return f"Generate a robust low-SNR waveform using exactly {modulation_hint}. Use exactly these parameters: {params_text}"
+            return "generate a robust low-snr waveform"
+        if style == "advanced":
+            base = (
+                "Generate a complex baseband waveform with clear symbol separability, "
+                "stable phase behavior, and demodulation-friendly structure."
+            )
+            if modulation_hint:
+                base += f" Use exactly {modulation_hint} modulation."
+            if params_text:
+                base += f" Use exactly these parameters: {params_text}"
+            return base
+        if modulation_hint:
+            return f"Generate a communication signal using exactly {modulation_hint}. Use exactly these parameters: {params_text}"
+        return "Generate a communication signal."
 
     if llm is not None:
         style_desc = {
@@ -155,7 +315,10 @@ def generate_prompt(style: str, llm=None, rag_context: str = "", modulation_hint
                 prompt = (
                     f"Write one short user prompt to request generation of a communication waveform.\n"
                     f"Style: {style_desc}. "
-                    f"Include modulation intent: {modulation_hint if modulation_hint else 'not specified'}. "
+                    f"Required modulation: {modulation_hint if modulation_hint else 'not specified'}. "
+                    f"Authoritative signal parameters: {params_text} "
+                    f"If a modulation is specified, you must use exactly that modulation name and must not substitute any other modulation. "
+                    f"You must use the given numerical values exactly and must not invent alternate sample counts, sampling rates, center frequencies, amplitudes, phases, or samples-per-symbol. "
                     f"One sentence only.\n"
                     f"Use only concepts from this context:\n{rag_context}"
                 )
@@ -163,34 +326,153 @@ def generate_prompt(style: str, llm=None, rag_context: str = "", modulation_hint
                 prompt = (
                     f"Write one short user prompt to request generation of a communication waveform. "
                     f"Style: {style_desc}. "
-                    f"Include modulation intent: {modulation_hint if modulation_hint else 'not specified'}. "
+                    f"Required modulation: {modulation_hint if modulation_hint else 'not specified'}. "
+                    f"Authoritative signal parameters: {params_text} "
+                    f"If a modulation is specified, you must use exactly that modulation name and must not substitute any other modulation. "
+                    f"You must use the given numerical values exactly and must not invent alternate sample counts, sampling rates, center frequencies, amplitudes, phases, or samples-per-symbol. "
                     f"One sentence only."
                 )
         try:
             out = llm.generate(prompt, max_new_tokens=96, temperature=0.75, top_p=0.9)
             txt = str(out).strip()
-            if txt:
+            if txt and _prompt_respects_modulation(txt, modulation_hint):
                 return txt
         except Exception:
             pass
 
-    if style == "dumb":
-        return "Write me a short poem about a potato."
-    if style == "vague":
-        if modulation_hint:
-            return f"generate a robust low-snr waveform, maybe {modulation_hint}"
-        return "generate a robust low-snr waveform"
-    if style == "advanced":
-        base = (
-            "Generate a complex baseband waveform with clear symbol separability, "
-            "stable phase behavior, and demodulation-friendly structure."
-        )
-        if modulation_hint:
-            base += f" Prefer {modulation_hint} if appropriate."
-        return base
-    if modulation_hint:
-        return f"Generate a communication signal using {modulation_hint}."
-    return "Generate a communication signal."
+    return fallback_prompt()
+
+
+def _semantic_similarity_band(idx: int, steps: int):
+    if steps <= 2:
+        return (0.95, 1.00)
+    if idx <= 0:
+        return (-1.0, 0.10)
+    if idx >= steps - 1:
+        return (0.98, 1.00)
+    explicit_bands = [
+        (0.10, 0.22),
+        (0.22, 0.34),
+        (0.34, 0.46),
+        (0.46, 0.58),
+        (0.58, 0.70),
+        (0.70, 0.80),
+        (0.80, 0.88),
+        (0.88, 0.94),
+    ]
+    if steps == 10 and 1 <= idx <= 8:
+        return explicit_bands[idx - 1]
+    frac = (idx - 1) / float(max(1, steps - 2))
+    center = 0.16 + 0.74 * frac
+    half_width = 0.07
+    lo = max(0.08, center - half_width)
+    hi = min(0.96, center + half_width)
+    return (lo, hi)
+
+
+def _fallback_semantic_prompt(base_prompt: str, modulation_hint: str, signal_params: dict, idx: int, steps: int) -> str:
+    params_text = _signal_params_text(signal_params) if signal_params is not None else ""
+    mod_text = f"{modulation_hint} " if modulation_hint else ""
+    templates = [
+        "Create a digital communication waveform.",
+        f"Generate a {mod_text}communication signal with the provided bits.",
+        f"Generate a {mod_text}baseband signal suitable for transmission.",
+        f"Generate a {mod_text}signal using the provided bits and these parameters: {params_text}",
+        f"Generate a {mod_text}waveform with a recognizable constellation and stable symbol behavior.",
+        f"Generate a {mod_text}baseband waveform with clear symbol separability, stable phase behavior, and these parameters: {params_text}",
+        f"Generate a {mod_text}complex baseband waveform consistent with this request: {base_prompt}",
+    ]
+    pick = min(len(templates) - 1, max(0, int(round((idx / float(max(1, steps - 1))) * (len(templates) - 1)))))
+    return templates[pick]
+
+
+def _prompt_duplicate_penalty(candidate: str, existing_prompts, sim_model) -> float:
+    if sim_model is None or not existing_prompts:
+        return 0.0
+    sims = [semantic_similarity(candidate, prior, sim_model) for prior in existing_prompts]
+    if not sims:
+        return 0.0
+    return max(sims)
+
+
+def generate_semantic_prompt_ladder(base_prompt: str, llm, rag_context: str, modulation_hint: str, signal_params: dict, steps: int, sim_model):
+    steps = max(2, int(steps))
+    params_text = _signal_params_text(signal_params) if signal_params is not None else ""
+    config_line = _signal_config_line(signal_params) if signal_params is not None else ""
+    prompts = []
+
+    for idx in range(steps):
+        if idx == 0:
+            prompts.append("What is the capital of Brazil?")
+            continue
+        if idx == steps - 1:
+            prompts.append(str(base_prompt).strip())
+            continue
+
+        target_lo, target_hi = _semantic_similarity_band(idx, steps)
+        target_mid = 0.5 * (target_lo + target_hi)
+        best_text = _fallback_semantic_prompt(base_prompt, modulation_hint, signal_params, idx, steps)
+        best_score = semantic_similarity(base_prompt, best_text, sim_model) if sim_model is not None else float("nan")
+        best_gap = abs(best_score - target_mid) if sim_model is not None else float("inf")
+        previous_scores = [semantic_similarity(base_prompt, prior, sim_model) for prior in prompts] if sim_model is not None else []
+        prev_score = previous_scores[-1] if previous_scores else -1.0
+
+        candidates = [best_text]
+        if llm is not None:
+            previous_prompt_text = "\n".join([f"- {p}" for p in prompts]) if prompts else "(none)"
+            for attempt in range(10):
+                temperature = min(0.95, 0.55 + 0.07 * attempt)
+                prompt = (
+                    f"SIGNAL CONFIG (authoritative; use exactly these values):\n"
+                    f"{config_line}\n\n"
+                    f"BASE PROMPT:\n{base_prompt}\n\n"
+                    f"ALREADY USED PROMPTS:\n{previous_prompt_text}\n\n"
+                    f"CONTEXT (RAG output; ONLY use facts stated here; do not invent):\n"
+                    f"{rag_context}\n\n"
+                    f"TARGET MODULATION: {modulation_hint if modulation_hint else 'not specified'}\n"
+                    f"AUTHORITATIVE SIGNAL PARAMETERS: {params_text}\n"
+                    f"Generate exactly one sentence.\n"
+                    f"The sentence must target cosine similarity in the range [{target_lo:.2f}, {target_hi:.2f}] "
+                    f"relative to the base prompt.\n"
+                    f"It must be meaningfully different from the already used prompts.\n"
+                    f"Its cosine similarity must be greater than the previous rung and less than the next higher bands.\n"
+                    f"For lower similarity, use broader or more indirect wording while staying in waveform generation.\n"
+                    f"For higher similarity, stay closer to the original meaning and wording.\n"
+                    f"If modulation is specified, use exactly that modulation name and do not mention any other modulation."
+                )
+                try:
+                    out = llm.generate(prompt, max_new_tokens=96, temperature=temperature, top_p=0.9)
+                    txt = str(out).strip()
+                    if txt:
+                        candidates.append(txt)
+                except Exception:
+                    pass
+
+        for txt in candidates:
+            if not txt or not _prompt_respects_modulation(txt, modulation_hint):
+                continue
+            score = semantic_similarity(base_prompt, txt, sim_model)
+            duplicate_penalty = _prompt_duplicate_penalty(txt, prompts, sim_model)
+            in_band = sim_model is not None and target_lo <= score <= target_hi
+            monotonic_ok = sim_model is None or score > prev_score + 0.03
+            unique_ok = duplicate_penalty < 0.97
+            if in_band and monotonic_ok and unique_ok:
+                best_text = txt
+                best_score = score
+                best_gap = 0.0
+                break
+            gap = abs(score - target_mid) if sim_model is not None else float("inf")
+            adjusted_gap = gap + max(0.0, duplicate_penalty - 0.92) * 5.0
+            if sim_model is not None and score <= prev_score:
+                adjusted_gap += (prev_score - score + 0.03) * 3.0
+            if adjusted_gap < best_gap:
+                best_text = txt
+                best_score = score
+                best_gap = adjusted_gap
+
+        prompts.append(best_text)
+
+    return prompts
 
 
 def infer_router_stats(model):
@@ -288,7 +570,13 @@ def run_single(args):
     out_path = args.out_dir or params.out_dir
 
     user_prompt, bits = load_cond_from_mat(args.file, prompt_key="prompt", bits_key="bits")
-    bits_cond = build_bits_cond(bits, N=int(params.sample_rate))
+    modulation_hint = infer_modulation_from_text(user_prompt)
+    bits_cond = build_bits_cond(
+        bits,
+        N=int(params.sample_rate),
+        modulation=modulation_hint,
+        sps=int(args.samples_per_symbol),
+    )
 
     with torch.no_grad():
         cond = {"prompt": user_prompt, "bits_cond": bits_cond}
@@ -307,6 +595,7 @@ def run_batch(args):
 
     llm = maybe_load_llm(args.use_llm_prompt)
     rag, rag_build_context = maybe_load_rag(args.use_rag, args.chunks_folder)
+    sim_model = maybe_load_similarity_model(bool(args.semantic_base_prompt))
     rfml_labels = [s.strip() for s in args.rfml_label_map.split(",")] if args.rfml_label_map.strip() else _default_rfml_labels()
     rfml_clf = maybe_load_rfml_classifier(
         path=args.rfml_clf_path,
@@ -317,41 +606,88 @@ def run_batch(args):
     if args.require_rfml and rfml_clf is None:
         raise RuntimeError("RFML classifier is required but could not be loaded.")
 
-    # Build balanced schedules, then shuffle for randomized order.
-    n = int(args.batch_tests)
-    if args.prompt_style == "mixed":
-        base_styles = ["dumb", "vague", "advanced"]
-        style_schedule = [base_styles[i % len(base_styles)] for i in range(n)]
-        rng.shuffle(style_schedule)
-    else:
-        style_schedule = [args.prompt_style for _ in range(n)]
-
-    mod_schedule = ["" for _ in range(n)]
-    if args.random_modulation_hint:
-        mod_base = ["BPSK", "QPSK", "8PSK"]
-        nondumb_idx = [i for i, s in enumerate(style_schedule) if s != "dumb"]
-        nondumb_mods = [mod_base[i % len(mod_base)] for i in range(len(nondumb_idx))]
-        rng.shuffle(nondumb_mods)
-        for i, m in zip(nondumb_idx, nondumb_mods):
-            mod_schedule[i] = m
-
-    rows = []
-    for i in range(args.batch_tests):
-        style = style_schedule[i]
-        modulation_hint = mod_schedule[i]
-
+    # Build either a semantic ladder or a balanced mixed schedule.
+    semantic_mode = bool(args.semantic_base_prompt)
+    if semantic_mode:
+        n = int(args.semantic_steps)
+        style_schedule = ["semantic" for _ in range(n)]
+        mod_schedule = [str(args.semantic_modulation).upper() for _ in range(n)]
+        base_signal_params = _signal_params_dict(args, params, modulation_hint=str(args.semantic_modulation).upper())
         rag_ctx = ""
         if rag is not None and rag_build_context is not None:
             try:
-                q = build_rag_query(style=style)
+                q = build_rag_query(style="advanced", modulation_hint=str(args.semantic_modulation).upper(), signal_params=base_signal_params)
                 rag_results = rag.search(q, top_k=int(args.rag_top_k))
                 rag_ctx = rag_build_context(rag_results, max_chars=int(args.rag_max_chars))
             except Exception:
                 rag_ctx = ""
+        prompt_schedule = generate_semantic_prompt_ladder(
+            base_prompt=args.semantic_base_prompt,
+            llm=llm,
+            rag_context=rag_ctx,
+            modulation_hint=str(args.semantic_modulation).upper(),
+            signal_params=base_signal_params,
+            steps=n,
+            sim_model=sim_model,
+        )
+        shared_bits = rng.integers(0, 2, size=int(args.bits_len), dtype=np.uint8)
+    else:
+        n = int(args.batch_tests)
+        if args.prompt_style == "mixed":
+            base_styles = ["dumb", "vague", "advanced"]
+            style_schedule = [base_styles[i % len(base_styles)] for i in range(n)]
+            rng.shuffle(style_schedule)
+        else:
+            style_schedule = [args.prompt_style for _ in range(n)]
 
-        prompt = generate_prompt(style=style, llm=llm, rag_context=rag_ctx, modulation_hint=modulation_hint)
-        bits = rng.integers(0, 2, size=int(args.bits_len), dtype=np.uint8)
-        bits_cond = build_bits_cond(bits, N=int(params.sample_rate))
+        mod_schedule = ["" for _ in range(n)]
+        if args.random_modulation_hint:
+            mod_base = ["BPSK", "QPSK", "8PSK", "16QAM"]
+            nondumb_idx = [i for i, s in enumerate(style_schedule) if s != "dumb"]
+            nondumb_mods = [mod_base[i % len(mod_base)] for i in range(len(nondumb_idx))]
+            rng.shuffle(nondumb_mods)
+            for i, m in zip(nondumb_idx, nondumb_mods):
+                mod_schedule[i] = m
+        prompt_schedule = None
+        shared_bits = None
+
+    rows = []
+    for i in range(n):
+        style = style_schedule[i]
+        modulation_hint = mod_schedule[i]
+        signal_params = _signal_params_dict(args, params, modulation_hint=modulation_hint)
+
+        if semantic_mode:
+            rag_ctx = ""
+            prompt = prompt_schedule[i]
+            bits = shared_bits.copy()
+            semantic_score = semantic_similarity(args.semantic_base_prompt, prompt, sim_model)
+        else:
+            rag_ctx = ""
+            if rag is not None and rag_build_context is not None:
+                try:
+                    q = build_rag_query(style=style, modulation_hint=modulation_hint, signal_params=signal_params)
+                    rag_results = rag.search(q, top_k=int(args.rag_top_k))
+                    rag_ctx = rag_build_context(rag_results, max_chars=int(args.rag_max_chars))
+                except Exception:
+                    rag_ctx = ""
+
+            prompt = generate_prompt(
+                style=style,
+                llm=llm,
+                rag_context=rag_ctx,
+                modulation_hint=modulation_hint,
+                signal_params=signal_params,
+            )
+            bits = rng.integers(0, 2, size=int(args.bits_len), dtype=np.uint8)
+            semantic_score = float("nan")
+        cosine_similarity_score = semantic_score
+        bits_cond = build_bits_cond(
+            bits,
+            N=int(params.sample_rate),
+            modulation=modulation_hint,
+            sps=int(args.samples_per_symbol),
+        )
 
         with torch.no_grad():
             cond = {"prompt": prompt, "bits_cond": bits_cond}
@@ -399,15 +735,30 @@ def run_batch(args):
                 "file": os.path.basename(out_file),
                 "labels_per_sample_tag": int(args.labels_per_sample_tag),
                 "prompt_style": style,
+                "modulation_hint": modulation_hint,
                 "requested_modulation": requested_mod,
                 "rfml_modulation": rfml_mod,
                 "rfml_confidence": rfml_conf,
                 "rfml_match_requested": rfml_match_requested,
                 "rag_used": 1 if rag_ctx else 0,
                 "bits_len": int(args.bits_len),
+                "prompt_text": prompt,
+                "semantic_score": semantic_score,
+                "num_samples": int(signal_params["number_of_samples"]),
+                "sampling_freq_hz": float(signal_params["sampling_rate_hz"]),
+                "amplitude": float(signal_params["amplitude"]),
+                "center_freq_hz": float(signal_params["center_frequency_hz"]),
+                "phase_deg": float(signal_params["phase_degrees"]),
+                "samples_per_symbol": int(signal_params["samples_per_symbol"]),
             }
         )
-        print(f"[{i+1}/{args.batch_tests}] saved {out_file}")
+        if not np.isnan(cosine_similarity_score):
+            print(
+                f"[{i+1}/{args.batch_tests}] cosine_similarity_score="
+                f"{cosine_similarity_score:.4f} saved {out_file}"
+            )
+        else:
+            print(f"[{i+1}/{args.batch_tests}] saved {out_file}")
 
     csv_path = os.path.join(out_dir, args.batch_csv)
     with open(csv_path, "w", newline="") as f:
@@ -425,6 +776,14 @@ def run_batch(args):
                 "rfml_match_requested",
                 "rag_used",
                 "bits_len",
+                "prompt_text",
+                "semantic_score",
+                "num_samples",
+                "sampling_freq_hz",
+                "amplitude",
+                "center_freq_hz",
+                "phase_deg",
+                "samples_per_symbol",
             ],
         )
         w.writeheader()
@@ -462,6 +821,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_out_dir", type=str, default="./results/prediction_batch", help="Batch outputs directory.")
     parser.add_argument("--batch_csv", type=str, default="batch_metrics.csv", help="Batch metrics CSV filename.")
     parser.add_argument("--bits_len", type=int, default=1024, help="Random bitstream length per batch test.")
+    parser.add_argument("--num_samples", type=int, default=2048, help="Number of IQ samples to describe in generated batch prompts; defaults to params.sample_rate.")
+    parser.add_argument("--sampling_freq_hz", type=float, default=1e6, help="Authoritative sampling frequency to include in generated batch prompts.")
+    parser.add_argument("--amplitude", type=float, default=1.0, help="Authoritative amplitude to include in generated batch prompts.")
+    parser.add_argument("--center_freq_hz", type=float, default=0.0, help="Authoritative center frequency to include in generated batch prompts.")
+    parser.add_argument("--phase_deg", type=float, default=0.0, help="Authoritative phase in degrees to include in generated batch prompts.")
+    parser.add_argument("--samples_per_symbol", type=int, default=1, help="Samples per symbol used when building modulation-aware bits_cond and batch prompts.")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed for batch tests.")
     parser.add_argument("--prompt_style", type=str, default="mixed", choices=["dumb", "vague", "advanced", "mixed"], help="Prompt style for batch generation.")
     parser.add_argument("--use_llm_prompt", action="store_true", help="Use local RAG.llm LLM for prompt generation if available.")
@@ -476,4 +841,7 @@ if __name__ == "__main__":
     parser.add_argument("--require_rfml", action="store_true", help="Fail fast if RFML package/checkpoint/model loading fails.")
     parser.add_argument("--plot", action="store_true", help="Save constellation plot PNG per generated batch sample.")
     parser.add_argument("--plot_stride", type=int, default=1, help="Subsample factor for constellation plotting (e.g., 2 keeps every 2nd point).")
+    parser.add_argument("--semantic_base_prompt", type=str, default="", help="If set, run a semantic-similarity ladder around this base prompt.")
+    parser.add_argument("--semantic_steps", type=int, default=10, help="Number of prompts in semantic ladder mode.")
+    parser.add_argument("--semantic_modulation", type=str, default="16QAM", help="Fixed modulation used in semantic ladder mode.")
     main(parser.parse_args())

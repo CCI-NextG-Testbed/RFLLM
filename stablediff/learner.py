@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import glob
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,11 +17,35 @@ try:
 except Exception:
     rfml_evm = None
 
+class tfdiffLoss(nn.Module):
+    def __init__(self, w=0.1):
+        super().__init__()
+        self.w = w
+
+    def forward(self, target, est, target_noise=None, est_noise=None):
+        target_c = torch.view_as_complex(target).squeeze(-1)
+        est_c = torch.view_as_complex(est).squeeze(-1)
+        target_fft = torch.fft.fft(target_c, dim=1)
+        est_fft = torch.fft.fft(est_c, dim=1)
+        t_loss = self.complex_mse_loss(target, est)
+        f_loss = torch.mean(torch.abs(target_fft - est_fft) ** 2)
+        n_loss = (
+            self.complex_mse_loss(target_noise, est_noise)
+            if target_noise is not None and est_noise is not None
+            else torch.tensor(0.0, device=target.device, dtype=target.dtype)
+        )
+        return (t_loss + f_loss + self.w * n_loss)
+
+    def complex_mse_loss(self, target, est):
+        target = torch.view_as_complex(target)
+        est = torch.view_as_complex(est)
+        return torch.mean(torch.abs(target-est)**2)
 
 class IQPlusBitsLoss(nn.Module):
-    def __init__(self, alpha=0.6, eps=1e-8):
+    def __init__(self, w_time=0.5, eps=1e-8):
         super().__init__()
-        self.alpha = float(alpha)
+        self.w_time = min(max(float(w_time), 0.0), 1.0)
+        self.w_evm = 1.0 - self.w_time
         self.eps = eps
 
     @staticmethod
@@ -56,32 +81,8 @@ class IQPlusBitsLoss(nn.Module):
             return torch.tensor(0.0, device=est_c.device, dtype=torch.float32)
         return torch.stack(losses).mean()
 
-    @staticmethod
-    def _prepare_bits_target(bits, B, N, device):
-        if bits is None:
-            return None
-        b = bits.to(device).float()
-        if b.dim() > 2:
-            b = b.reshape(b.shape[0], -1)
-        if b.dim() != 2 or b.shape[0] != B:
-            return None
-        if b.shape[1] < N:
-            b = F.pad(b, (0, N - b.shape[1]))
-        elif b.shape[1] > N:
-            b = b[:, :N]
-        return b
-
-    def forward(self, target_ri, est_ri, bits=None, sps=None, return_components=False):
+    def forward(self, target_ri, est_ri, sps=None, return_components=False):
         l_iq = self.complex_mse(target_ri, est_ri)
-
-        B = est_ri.shape[0]
-        N = est_ri.shape[1]
-
-        l_bits = torch.tensor(0.0, device=est_ri.device, dtype=torch.float32)
-        bits_tgt = self._prepare_bits_target(bits, B, N, est_ri.device)
-        if bits_tgt is not None:
-            logits = est_ri[..., 0].squeeze(-1)  # [B,N] real path logits
-            l_bits = F.binary_cross_entropy_with_logits(logits, bits_tgt)
 
         target_c = torch.view_as_complex(target_ri).squeeze(-1)  # [B,N]
         est_c = torch.view_as_complex(est_ri).squeeze(-1)        # [B,N]
@@ -90,10 +91,9 @@ class IQPlusBitsLoss(nn.Module):
             l_evm = self._symbol_evm_loss(est_c, target_c, sps)
 
         if return_components:
-            return l_iq, l_bits, l_evm
+            return l_iq, l_evm
 
-        a = self.alpha
-        loss = (1.0 - a) * l_iq + 0.5 * a * l_bits + 0.5 * a * l_evm
+        loss = self.w_time * l_iq + self.w_evm * l_evm
         return loss
         
 
@@ -114,12 +114,23 @@ class tfdiffLearner:
         self.params = params
         self.iter = 0
         self.is_master = True
-        self.loss_fn = IQPlusBitsLoss(
-            alpha=float(getattr(params, "loss_alpha", 0.6)),
+        self.loss_fn_rf_diff = tfdiffLoss(w=float(getattr(params, "loss_w_fft", 0.1)))
+        self.loss_fn_iq_plus_bits = IQPlusBitsLoss(
+            w_time=float(getattr(params, "loss_w_time", 0.5)),
         )
+        self.loss_fn = self.loss_fn_rf_diff if bool(getattr(params, "use_tfdiff_loss", False)) else self.loss_fn_iq_plus_bits
         self.summary_writer = None
         self.epoch_history = []
+        self.epoch_train_losses = []
+        self.epoch_test_losses = []
         self.snapshot_dir = os.path.join(self.model_dir, "training_snapshots")
+        self.train_sample_count = int(getattr(self.dataset, "sample_count", len(getattr(self.dataset, "dataset", [])) if hasattr(self.dataset, "dataset") else 0))
+        self.test_sample_count = int(getattr(self.val_dataset, "sample_count", len(getattr(self.val_dataset, "dataset", [])) if hasattr(self.val_dataset, "dataset") else 0))
+        self.train_modulation_counts = dict(getattr(self.dataset, "modulation_counts", {}))
+        self.test_modulation_counts = dict(getattr(self.val_dataset, "modulation_counts", {}))
+        self.metrics_csv_path = str(
+            getattr(self.params, "training_metrics_csv", os.path.join(self.model_dir, "training_convergence.csv"))
+        )
         if self.val_dataset is None:
             raise ValueError("A test/validation dataloader is mandatory in this training configuration.")
 
@@ -132,6 +143,7 @@ class tfdiffLearner:
             'iter': self.iter,
             'model': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model_state.items()},
             'optimizer': {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer.state_dict().items()},
+            'lr_scheduler': self.lr_scheduler.state_dict(),
             'params': dict(self.params),
         }
 
@@ -141,6 +153,8 @@ class tfdiffLearner:
         else:
             self.model.load_state_dict(state_dict['model'])
         self.optimizer.load_state_dict(state_dict['optimizer'])
+        if 'lr_scheduler' in state_dict:
+            self.lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
         self.iter = state_dict['iter']
 
     def save_to_checkpoint(self, filename='weights'):
@@ -151,7 +165,7 @@ class tfdiffLearner:
         if os.name == 'nt':
             torch.save(self.state_dict(), link_name)
         else:
-            if os.path.islink(link_name):
+            if os.path.lexists(link_name):
                 os.unlink(link_name)
             os.symlink(save_basename, link_name)
 
@@ -276,11 +290,6 @@ class tfdiffLearner:
             x = x[:N]
         x_t = torch.from_numpy(x.astype(np.complex64)).to(device).view(N, 1)
         x_ri = torch.view_as_real(x_t).to(torch.float32)  # [N,1,2]
-        mean = x_ri.mean()
-        std = x_ri.std(unbiased=False)
-        if std < 1e-8:
-            std = torch.tensor(1.0, device=x_ri.device)
-        x_ri = (x_ri - mean) / std
         return x_ri
 
     def _save_epoch_snapshot(self, epoch_idx: int):
@@ -293,8 +302,8 @@ class tfdiffLearner:
             if len(data_roots) == 0:
                 return
             data_dir = data_roots[0]
-            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK"]))
-            mods = [str(m).upper() for m in mods][:3]
+            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK", "16QAM"]))
+            mods = [str(m).upper() for m in mods][:4]
             N = int(getattr(self.params, "sample_rate", 2048))
             device = next(self.model.parameters()).device
 
@@ -329,14 +338,56 @@ class tfdiffLearner:
         except Exception as e:
             print(f"[warn] failed to save epoch snapshot {epoch_idx}: {e}")
 
+    def _batch_modulation_evm(self, target_ri, est_ri, modulation, sps):
+        if modulation is None or sps is None:
+            return {}
+        target_c = torch.view_as_complex(target_ri).squeeze(-1)
+        est_c = torch.view_as_complex(est_ri).squeeze(-1)
+        evm_by_mod = {}
+        count_by_mod = {}
+        for i, mod in enumerate(modulation):
+            mod_name = str(mod).upper()
+            evm_i = float(
+                self.loss_fn_iq_plus_bits._symbol_evm_loss(
+                    est_c[i:i + 1],
+                    target_c[i:i + 1],
+                    sps[i:i + 1],
+                ).detach().item()
+            )
+            evm_by_mod[mod_name] = evm_by_mod.get(mod_name, 0.0) + evm_i
+            count_by_mod[mod_name] = count_by_mod.get(mod_name, 0) + 1
+        return {mod: evm_by_mod[mod] / max(1, count_by_mod[mod]) for mod in evm_by_mod}
+
+    def _write_convergence_csv(self, epoch_idx: int, train_loss: float, test_loss: float, evm_by_mod: dict):
+        mods = sorted(set(self.train_modulation_counts.keys()) | set(self.test_modulation_counts.keys()) | set(evm_by_mod.keys()))
+        row = {
+            "epoch": int(epoch_idx),
+            "train_loss": float(train_loss),
+            "test_loss": float(test_loss),
+            "train_sample_count": int(self.train_sample_count),
+        }
+        for mod in mods:
+            row[f"test_evm_{mod}"] = float(evm_by_mod.get(mod, float("nan")))
+
+        fieldnames = list(row.keys())
+        os.makedirs(os.path.dirname(os.path.abspath(self.metrics_csv_path)) or ".", exist_ok=True)
+        write_header = not os.path.exists(self.metrics_csv_path)
+        with open(self.metrics_csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
     def _evaluate_reverse_diffusion(self):
         if self.val_dataset is None:
-            return float("nan")
+            return float("nan"), {}
         device = next(self.model.parameters()).device
         was_training = self.model.training
         self.model.eval()
         loss_sum = 0.0
         loss_count = 0
+        mod_evm_sum = {}
+        mod_evm_count = {}
         with torch.no_grad():
             for features in self.val_dataset:
                 features = _nested_map(
@@ -347,21 +398,13 @@ class tfdiffLearner:
                 data = features['data']
                 prompts = features['prompt']
                 bits_cond = features.get('bits_cond', features.get('bits', None))
-                bits_full = features.get('bits_full', None)
-                bits_len = features.get('bits_len', None)
                 modulation = features.get('modulation', None)
                 sps = features.get('samples_per_symbol', None)
 
                 cond = {'prompt': prompts, 'bits_cond': bits_cond}
                 predicted = self.diffusion.sampling(self.model, cond, device)
 
-                bits_for_loss = features.get('bits_cond', features.get('bits', None))
-                base_loss = self.loss_fn(
-                    data,
-                    predicted,
-                    bits=bits_for_loss,
-                    sps=sps,
-                )
+                base_loss = self._base_loss(data, predicted, sps=sps)
 
                 model_ref = self.model.module if hasattr(self.model, "module") else self.model
                 mod_logits = getattr(model_ref, "last_mod_logits", None)
@@ -379,11 +422,22 @@ class tfdiffLearner:
                 loss_sum += float(loss.item())
                 loss_count += 1
 
+                batch_evm = self._batch_modulation_evm(data, predicted, modulation, sps)
+                for mod, evm_val in batch_evm.items():
+                    mod_evm_sum[mod] = mod_evm_sum.get(mod, 0.0) + float(evm_val)
+                    mod_evm_count[mod] = mod_evm_count.get(mod, 0) + 1
+
         if was_training:
             self.model.train()
         if loss_count == 0:
-            return float("nan")
-        return loss_sum / float(loss_count)
+            return float("nan"), {}
+        evm_by_mod = {mod: mod_evm_sum[mod] / max(1, mod_evm_count[mod]) for mod in mod_evm_sum}
+        return loss_sum / float(loss_count), evm_by_mod
+
+    def _base_loss(self, target_ri, est_ri, sps=None):
+        if self.loss_fn is self.loss_fn_rf_diff:
+            return self.loss_fn(target_ri, est_ri)
+        return self.loss_fn(target_ri, est_ri, sps=sps)
 
     def _symbol_rate_view(self, x: np.ndarray, sps: int, max_symbols: int):
         T = min(len(x) // sps, max_symbols)
@@ -399,10 +453,8 @@ class tfdiffLearner:
 
         try:
             out_path = str(getattr(self.params, "training_animation_out", "./results/training_mods.gif"))
-            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK"]))
-            mods = [str(m).upper() for m in mods][:3]
-            wave_samples = int(getattr(self.params, "training_animation_wave_samples", 400))
-            wave_stride = int(getattr(self.params, "training_animation_wave_stride", 2))
+            mods = list(getattr(self.params, "training_animation_mods", ["BPSK", "QPSK", "8PSK", "16QAM"]))
+            mods = [str(m).upper() for m in mods][:4]
             max_symbols = int(getattr(self.params, "training_animation_max_symbols", 256))
             fps = int(getattr(self.params, "training_animation_fps", 2))
             snap_files = sorted(glob.glob(os.path.join(self.snapshot_dir, "snapshot_epoch_*.npz")))
@@ -412,11 +464,14 @@ class tfdiffLearner:
             snapshots = [np.load(p, allow_pickle=True) for p in snap_files]
             epochs = np.asarray([int(s["epoch"][0]) for s in snapshots], dtype=np.int64)
 
-            fig, axes = plt.subplots(2, 3, figsize=(14, 8.5))
-            ax_const = [axes[0, 0], axes[0, 1], axes[0, 2]]
-            ax_wave = [axes[1, 0], axes[1, 1], axes[1, 2]]
+            nmods = max(1, len(mods))
+            ncols = 2 if nmods > 1 else 1
+            nrows = int(np.ceil(nmods / float(ncols)))
+            fig, ax_grid = plt.subplots(nrows, ncols, figsize=(7.0 * ncols, 6.5 * nrows))
+            ax_const = np.atleast_1d(ax_grid).ravel().tolist()
+            for ax in ax_const[nmods:]:
+                ax.set_visible(False)
             pred_scats = []
-            pred_lines = []
             for i, mod in enumerate(mods):
                 s0 = snapshots[0]
                 target = np.asarray(s0[f"{mod}_target"])
@@ -443,30 +498,6 @@ class tfdiffLearner:
                 ax_const[i].grid(True, alpha=0.3)
                 ax_const[i].legend(loc="upper right", fontsize=8)
 
-                n = min(wave_samples, len(target), len(pred))
-                stride = max(1, wave_stride)
-                t = np.arange(0, n, stride)
-                tx_r_vals = np.real(target[:n])[::stride]
-                tx_i_vals = np.imag(target[:n])[::stride]
-                pr_r_vals = np.real(pred[:n])[::stride]
-                pr_i_vals = np.imag(pred[:n])[::stride]
-
-                tx_r, = ax_wave[i].plot(t, tx_r_vals, lw=0.9, ls="--", color="tab:blue", alpha=0.4, label="Tx Real")
-                tx_i, = ax_wave[i].plot(t, tx_i_vals, lw=0.9, ls="--", color="tab:orange", alpha=0.4, label="Tx Imag")
-                pr_r, = ax_wave[i].plot(t, pr_r_vals, lw=2.0, marker="o", ms=2.2, markevery=max(1, len(t)//60), color="tab:blue", label="Pred Real")
-                pr_i, = ax_wave[i].plot(t, pr_i_vals, lw=2.0, marker="o", ms=2.2, markevery=max(1, len(t)//60), color="tab:orange", label="Pred Imag")
-                pred_lines.append((pr_r, pr_i, n, stride, sps))
-
-                ax_wave[i].set_title(f"{mod} Signal")
-                ax_wave[i].set_xlabel("Sample")
-                ax_wave[i].set_ylabel("Amplitude")
-                ymax = float(np.max(np.abs(np.concatenate([tx_r_vals, tx_i_vals, pr_r_vals, pr_i_vals])))) if n > 0 else 1.0
-                ymax = max(1.0, 1.15 * ymax)
-                ax_wave[i].set_ylim(-ymax, ymax)
-                ax_wave[i].set_xlim(0, max(1, n - 1))
-                ax_wave[i].grid(True, alpha=0.3)
-                ax_wave[i].legend(loc="upper right", fontsize=7)
-
             title = fig.suptitle("", fontsize=12)
 
             def _update(k):
@@ -478,19 +509,9 @@ class tfdiffLearner:
                     pred_sym = self._symbol_rate_view(pred, sps=sps, max_symbols=max_symbols)
                     pts = np.column_stack([np.real(pred_sym), np.imag(pred_sym)]) if len(pred_sym) else np.zeros((0, 2))
                     pred_sc.set_offsets(pts)
-
-                    pr_r, pr_i, n, stride, _ = pred_lines[i]
-                    n = min(n, len(pred))
-                    t = np.arange(0, n, stride)
-                    pr_r_vals = np.real(pred[:n])[::stride]
-                    pr_i_vals = np.imag(pred[:n])[::stride]
-                    pr_r.set_data(t, pr_r_vals)
-                    pr_i.set_data(t, pr_i_vals)
                 title.set_text(f"Epoch {int(e)}")
                 artists = [title]
                 artists.extend([x[0] for x in pred_scats])
-                artists.extend([x[0] for x in pred_lines])
-                artists.extend([x[1] for x in pred_lines])
                 return artists
 
             ani = animation.FuncAnimation(
@@ -563,17 +584,25 @@ class tfdiffLearner:
             else:
                 epoch_loss_mean = float("nan")
             val_loss = float("nan")
+            evm_by_mod = {}
 
             
             if self.is_master:
                 # ---- checkpoint once per epoch ----
                 self.save_to_checkpoint()
-                val_loss = self._evaluate_reverse_diffusion()
+                val_loss, evm_by_mod = self._evaluate_reverse_diffusion()
+                self.epoch_train_losses.append(float(epoch_loss_mean))
+                self.epoch_test_losses.append(float(val_loss))
+                self._write_convergence_csv(epoch_idx, epoch_loss_mean, val_loss, evm_by_mod)
+                evm_summary = " ".join(
+                    [f"{mod}_evm={evm_by_mod[mod]:.4f}" for mod in sorted(evm_by_mod.keys())]
+                )
 
                 tqdm.write(
                     f"\n=== Epoch {epoch_idx} complete === "
                     f"train_loss={epoch_loss_mean:.6f} "
-                    f"test_loss={val_loss:.6f}\n"
+                    f"test_loss={val_loss:.6f} "
+                    f"{evm_summary}"
                 )
             self.epoch_history.append(int(epoch_idx))
 
@@ -593,8 +622,6 @@ class tfdiffLearner:
         data = features['data']          # [B, ...]
         prompts = features['prompt']     # list[str]
         bits_cond = features.get('bits_cond', features.get('bits', None)) # [B, N] or None
-        bits_full = features.get('bits_full', None)
-        bits_len = features.get('bits_len', None)
         modulation = features.get('modulation', None)
         sps = features.get('samples_per_symbol', None)
 
@@ -607,13 +634,7 @@ class tfdiffLearner:
         cond = {'prompt': prompts, 'bits_cond': bits_cond}
         predicted = self.model(degrade_data, t, cond)
 
-        bits_for_loss = features.get('bits_cond', features.get('bits', None))
-        base_loss = self.loss_fn(
-            data,
-            predicted,
-            bits=bits_for_loss,
-            sps=sps,
-        )
+        base_loss = self._base_loss(data, predicted, sps=sps)
 
         # Supervise learned prompt->modulation routing head.
         model_ref = self.model.module if hasattr(self.model, "module") else self.model

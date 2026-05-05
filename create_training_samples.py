@@ -8,11 +8,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.io import savemat
 
 # Local Wrappers
 from RAG.llm import LLM
-from RAG.rag import RAGSearch, build_context
 
 # ===========================
 # CONFIG
@@ -35,6 +35,19 @@ def sanitize_filename(s: str, max_len: int = 180) -> str:
     s = re.sub(r"\s+", "_", s)
     s = re.sub(r"[^a-zA-Z0-9._-]+", "", s)
     return s[:max_len] if len(s) > max_len else s
+
+
+def existing_signal_indices(out_dir: str, stem: str):
+    pattern = re.compile(rf"^{re.escape(stem)}_s(\d+)\.mat$")
+    found = []
+    try:
+        for name in os.listdir(out_dir):
+            m = pattern.match(name)
+            if m:
+                found.append(int(m.group(1)))
+    except FileNotFoundError:
+        return []
+    return sorted(found)
 
 
 def load_db_from_folder(folder: str):
@@ -139,10 +152,16 @@ def build_llm_prompt(params: dict, context: str) -> str:
     """.strip()
 
 
-def build_label_variants(params: dict, context: str, llm, labels_per_sample: int):
+def _label_style_for_index(idx: int) -> str:
+    styles = ["advanced", "less_advanced", "simple"]
+    return styles[int(idx) % len(styles)]
+
+
+def build_single_label(params: dict, context: str, llm, style: str, variation_idx: int, used_labels=None, use_rag: bool = True):
     """
-    Create multiple label variants for the same IQ/bits sample.
-    Mixes structured template labels and LLM-generated labels with different styles.
+    Create one label for one IQ/bits sample.
+    The label style cycles by generation index so repeated samples from the same
+    modulation template do not all receive the same complexity level.
     """
     mod = _safe_str(params.get("Modulation")).strip().upper().replace("-", "").replace(" ", "")
     N = int(params.get("Number of Samples"))
@@ -151,63 +170,85 @@ def build_label_variants(params: dict, context: str, llm, labels_per_sample: int
     fc = float(params.get("Center Frequency (Hz)"))
     phase = float(params.get("Phase (degrees)"))
     sps = int(params.get("Samples Per Symbol", 1) or 1)
-
-    styles = [
-        "simple",
-        "informative",
-        "technical",
-        "natural",
-    ]
+    style = str(style).strip().lower()
 
     template_map = {
-        "simple": f"Generate a {mod} IQ signal.",
-        "informative": (
-            f"Generate a {mod} baseband IQ signal with N={N}, fs={fs} Hz, "
+        "simple": f"Generate a {mod} IQ signal with the provided bitstream.",
+        "less_advanced": (
+            f"Generate a {mod} baseband IQ waveform with N={N}, fs={fs} Hz, "
             f"samples_per_symbol={sps}, amplitude={amp}, center_frequency={fc} Hz, and phase={phase} deg."
         ),
-        "technical": (
-            f"Create a {mod} communication waveform in complex IQ form, preserving symbol mapping, "
-            f"constellation structure, and decision boundaries for reliable demodulation."
-        ),
-        "natural": (
-            f"Please produce a realistic {mod} signal using complex I/Q samples, suitable for digital transmission."
+        "advanced": (
+            f"Create a {mod} communication waveform in complex IQ form, preserving constellation geometry, "
+            f"symbol timing, and demodulation-friendly structure under the stated parameters."
         ),
     }
+    seed_label = template_map.get(style, template_map["advanced"])
+    prior_labels = list(used_labels or [])
+    prior_text = "\n".join(f"- {x}" for x in prior_labels[-6:]) if prior_labels else "(none yet)"
+    context_header = "CONTEXT (use only facts stated here):" if use_rag else "PURE LLM MODE (no retrieved RAG context):"
+    context_instruction = (
+        "Use the retrieved context for modulation facts and do not invent unsupported details."
+        if use_rag
+        else "Use your general digital communications knowledge, grounded by the signal config, without citing retrieved sources."
+    )
 
-    variants = []
-    for i in range(max(1, int(labels_per_sample))):
-        style = styles[i % len(styles)]
-        seed_label = template_map[style]
+    prompt = f"""
+        SIGNAL CONFIG (authoritative):
+        Modulation={mod}; N={N}; sampling_rate_hz={fs}; samples_per_symbol={sps}; amplitude={amp}; center_frequency_hz={fc}; initial_phase_deg={phase}.
 
-        prompt = f"""
-            SIGNAL CONFIG (authoritative):
-            Modulation={mod}; N={N}; sampling_rate_hz={fs}; samples_per_symbol={sps}; amplitude={amp}; center_frequency_hz={fc}; initial_phase_deg={phase}.
+        LABEL STYLE:
+        {style}
 
-            LABEL STYLE:
-            {style}
+        VARIATION INDEX:
+        {variation_idx}
 
-            CONTEXT (use only facts stated here):
-            {context}
+        PREVIOUS LABELS FOR THIS TEMPLATE (avoid repeating their wording):
+        {prior_text}
 
-            Write exactly TWO sentences as a training label for this signal.
-            Keep the style as requested. Keep it concise and modulation-grounded.
-        """.strip()
+        {context_header}
+        {context}
 
-        try:
-            raw = llm.generate(
-                prompt,
-                max_new_tokens=196,
-                temperature=0.25 + 0.1 * (i % len(styles)),
-                top_p=0.9,
-            )
-            label = json.dumps(raw) if isinstance(raw, (list, dict)) else str(raw).strip()
-            if not label:
-                label = seed_label
-        except Exception:
+        Write exactly TWO sentences as a training label for this signal.
+        {context_instruction}
+        Keep the style as requested, keep it modulation-grounded, and use distinct wording from the previous labels.
+    """.strip()
+
+    try:
+        raw = llm.generate(
+            prompt,
+            max_new_tokens=196,
+            temperature=0.35 + 0.08 * (variation_idx % 3),
+            top_p=0.9,
+        )
+        label = json.dumps(raw) if isinstance(raw, (list, dict)) else str(raw).strip()
+        if not label:
             label = seed_label
+    except Exception:
+        label = seed_label
 
-        variants.append({"style": style, "label": label})
-    return variants
+    if used_labels is not None and label in used_labels:
+        label = f"{seed_label} Variation {variation_idx + 1}."
+    return {"style": style, "label": label}
+
+
+def save_constellation_plot(path: str, iq_data: np.ndarray, title: str, stride: int = 1):
+    iq = np.asarray(iq_data).reshape(-1).astype(np.complex64, copy=False)
+    step = max(1, int(stride))
+    pts = iq[::step]
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(pts.real, pts.imag, ".", markersize=2)
+    plt.xlabel("In-Phase (I)")
+    plt.ylabel("Quadrature (Q)")
+    plt.title(title)
+    plt.grid(True, alpha=0.4)
+    plt.axhline(0.0, color="black", linewidth=0.5)
+    plt.axvline(0.0, color="black", linewidth=0.5)
+    plt.axis("equal")
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
 
 
 # ===========================
@@ -374,7 +415,16 @@ def generate_iq_from_excel_params(params: dict):
 # ===========================
 # Main Excel Loop
 # ===========================
-def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str, labels_per_sample: int):
+def process_excel(
+    excel_path: str,
+    out_dir: str,
+    top_k: int,
+    chunks_folder: str,
+    signals_per_row: int,
+    plot_constellation: bool = False,
+    plot_stride: int = 1,
+    use_rag: bool = True,
+):
     os.makedirs(out_dir, exist_ok=True)
 
     df = pd.read_excel(excel_path)
@@ -399,13 +449,35 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str,
     if "Output Name" not in df.columns:
         df["Output Name"] = ""
 
-    rag = RAGSearch(chunks_folder=chunks_folder)
+    if use_rag:
+        from RAG.rag import RAGSearch
+        rag = RAGSearch(chunks_folder=chunks_folder)
+    else:
+        rag = None
     llm = LLM()
+    if not use_rag:
+        llm.system_prompt = """
+            You are a digital communications (PHY) expert labeling simple digitally modulated IQ signals (non-Wi-Fi).
+
+            You will receive authoritative signal configuration values and no retrieved RAG context.
+            Your task is to produce EXACTLY TWO sentences total, on a SINGLE LINE, plain natural language only.
+
+            Sentence 1 must describe the modulation type, constellation or symbol-level meaning, and all provided signal parameters.
+            Sentence 2 must use general digital communications knowledge to describe expected IQ/constellation/time-domain behavior and relevant robustness or BER/SNR intuition.
+
+            STRICT RULES:
+            - Exactly TWO sentences.
+            - No bullet points, no lists, no colon-separated fields.
+            - Do not mention RAG, retrieval, sources, or missing context.
+            - Stay grounded in the SIGNAL CONFIG and common digital modulation facts.
+        """.strip()
+
+    manifest_rows = []
 
     for idx, row in df.iterrows():
         print(f"\n=== Processing row {idx} ===")
 
-        params = {
+        base_params = {
             "Modulation": row.get("Modulation"),
             "Number of Samples": row.get("Number of Samples"),
             "Sampling Rate (Hz)": row.get("Sampling Rate (Hz)"),
@@ -418,16 +490,22 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str,
 
         # 0) Generate the IQ + bits using EXCEL params
         try:
-            iq_data, bits = generate_iq_from_excel_params(params)
+            _ = bits_per_symbol(_safe_str(base_params.get("Modulation")).strip())
         except Exception as e:
-            print(f"  ERROR generating IQ for row {idx}: {e}")
+            print(f"  ERROR parsing row {idx}: {e}")
             continue
 
-        # 1) Build semantic query from params
-        query_text = signal_params_to_query(params)
-
-        # 2) RAG search
-        results = rag.search(query_text, top_k=top_k)
+        # 1) Optionally build RAG context from base params.
+        if use_rag:
+            query_text = signal_params_to_query(base_params)
+            results = rag.search(query_text, top_k=top_k)
+            context = build_context(results, max_chars=4000)
+        else:
+            results = []
+            context = (
+                "No retrieved context was used. Generate the label from the authoritative "
+                "signal configuration and general digital modulation knowledge."
+            )
 
         # MATLAB-friendly struct array for rag_results
         rag_results_struct = []
@@ -446,13 +524,8 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str,
             )
         rag_results_struct = np.array(rag_results_struct, dtype=object)
 
-        # 3) Build context
-        context = build_context(results, max_chars=4000)
-
         # 4) Multi-label generation for this single IQ/bits sample
-        label_variants = build_label_variants(params, context, llm, labels_per_sample)
-
-        # 5) Save MAT
+        # 4) Save N distinct signals for this modulation template.
         output_name = _safe_str(row.get("Output Name")).strip()
         if output_name:
             stem = sanitize_filename(output_name)
@@ -461,28 +534,81 @@ def process_excel(excel_path: str, out_dir: str, top_k: int, chunks_folder: str,
                 f"{row.get('Modulation')}_N{row.get('Number of Samples')}_sps{row.get('Samples Per Symbol', 1)}_amp{row.get('Amplitude')}_fc{row.get('Center Frequency (Hz)')}_ph{row.get('Phase (degrees)')}_row{idx}"
             )
 
-        mod_name = _safe_str(params.get("Modulation")).strip().upper().replace("-", "").replace(" ", "")
-        sps_val = int(params.get("Samples Per Symbol", 1) or 1)
+        mod_name = _safe_str(base_params.get("Modulation")).strip().upper().replace("-", "").replace(" ", "")
+        sps_val = int(base_params.get("Samples Per Symbol", 1) or 1)
         k_val = bits_per_symbol(mod_name)
-        n_variants = len(label_variants)
-        for j, lv in enumerate(label_variants):
-            mat_path = os.path.join(out_dir, f"{stem}_v{j:02d}.mat")
+
+        base_seed = base_params.get("Seed", None)
+        if isinstance(base_seed, float) and np.isnan(base_seed):
+            base_seed = None
+        base_seed = None if base_seed is None or str(base_seed).strip() == "" else int(base_seed)
+        row_rng = np.random.default_rng(base_seed if base_seed is not None else (idx + 1) * 7919)
+        used_labels = []
+        existing_indices = existing_signal_indices(out_dir, stem)
+        target_total = max(1, int(signals_per_row))
+        existing_set = set(existing_indices)
+        if len(existing_indices) >= target_total:
+            print(f"  Found {len(existing_indices)} existing samples for {stem}; nothing new to generate.")
+            continue
+        print(f"  Found {len(existing_indices)} existing samples for {stem}; generating up to {target_total}.")
+
+        for j in range(target_total):
+            if j in existing_set:
+                continue
+            signal_seed = int(base_seed + j) if base_seed is not None else int(row_rng.integers(0, 2**31 - 1))
+            params = dict(base_params)
+            params["Seed"] = signal_seed
+            try:
+                iq_data, bits = generate_iq_from_excel_params(params)
+            except Exception as e:
+                print(f"  ERROR generating IQ for row {idx}, sample {j}: {e}")
+                continue
+
+            style = _label_style_for_index(j)
+            label_info = build_single_label(params, context, llm, style, j, used_labels=used_labels, use_rag=use_rag)
+            used_labels.append(label_info["label"])
+
+            file_stem = f"{stem}_s{j:03d}"
+            mat_path = os.path.join(out_dir, f"{file_stem}.mat")
             mat_dict = {
                 "data": iq_data.astype(np.complex64),
                 "bits": bits.astype(np.int8),
                 "modulation": np.array([mod_name], dtype=object),
                 "bits_per_symbol": np.array([[k_val]], dtype=np.int32),
                 "samples_per_symbol": np.array([[sps_val]], dtype=np.int32),
-                "label": lv["label"],
+                "label": label_info["label"],
+                "label_mode": np.array(["rag_llm" if use_rag else "pure_llm"], dtype=object),
                 "rag_results": rag_results_struct,
             }
             savemat(mat_path, mat_dict)
-            print(f"  Saved MAT file: {mat_path}  [variant {j+1}/{n_variants}, style={lv['style']}]")
-        print("  Keys: data (complex64), bits (int8), modulation (str), bits_per_symbol (int), samples_per_symbol (int), label (str), rag_results (struct array)")
+            if plot_constellation:
+                plot_path = os.path.join(out_dir, f"{file_stem}_constellation.png")
+                plot_title = f"{mod_name} Constellation"
+                save_constellation_plot(plot_path, iq_data, plot_title, stride=plot_stride)
+            manifest_rows.append(
+                {
+                    "template_row": idx,
+                    "signal_index": j,
+                    "file": os.path.basename(mat_path),
+                    "modulation": mod_name,
+                    "seed": signal_seed,
+                    "label_style": label_info["style"],
+                    "label_mode": "rag_llm" if use_rag else "pure_llm",
+                    "bits_len": int(bits.size),
+                    "number_of_samples": int(base_params["Number of Samples"]),
+                }
+            )
+            print(f"  Saved MAT file: {mat_path}  [sample {j+1}/{target_total}, style={label_info['style']}]")
+        print("  Keys: data (complex64), bits (int8), modulation (str), bits_per_symbol (int), samples_per_symbol (int), label (str), label_mode (str), rag_results (struct array)")
+
+    if manifest_rows:
+        manifest_path = os.path.join(out_dir, "generation_manifest.csv")
+        pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+        print(f"Saved generation manifest: {manifest_path}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Excel → generate simple modulated IQ → RAG+LLM label → .mat")
+    ap = argparse.ArgumentParser(description="Excel → generate simple modulated IQ → LLM label → .mat")
     ap.add_argument("--excel", type=str, required=True, help="Path to Excel file with signal parameters.")
     ap.add_argument("--out_dir", type=str, required=True, help="Output directory for .mat files.")
     ap.add_argument("--top_k", type=int, default=5, help="Top-k RAG chunks used for LLM context.")
@@ -493,14 +619,40 @@ def main():
         help="Folder with JSON chunk files (must include embeddings).",
     )
     ap.add_argument(
-        "--labels_per_sample",
+        "--signals_per_row",
         type=int,
         default=1,
-        help="Number of distinct label variants to generate per IQ sample (same data/bits, different label text).",
+        help="Number of distinct IQ samples to generate from each Excel row template.",
+    )
+    ap.add_argument(
+        "--plot_constellation",
+        action="store_true",
+        help="Save one constellation PNG per generated IQ sample.",
+    )
+    ap.add_argument(
+        "--plot_stride",
+        type=int,
+        default=1,
+        help="Subsample factor for constellation plotting (e.g. 2 keeps every other point).",
+    )
+    ap.add_argument(
+        "--no_rag",
+        "--pure_llm",
+        action="store_true",
+        help="Skip RAG retrieval and generate labels with the LLM only.",
     )
     args = ap.parse_args()
 
-    process_excel(args.excel, args.out_dir, args.top_k, args.chunks_folder, args.labels_per_sample)
+    process_excel(
+        args.excel,
+        args.out_dir,
+        args.top_k,
+        args.chunks_folder,
+        args.signals_per_row,
+        plot_constellation=args.plot_constellation,
+        plot_stride=args.plot_stride,
+        use_rag=not args.no_rag,
+    )
 
 
 if __name__ == "__main__":
