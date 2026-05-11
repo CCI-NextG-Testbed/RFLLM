@@ -16,11 +16,28 @@ def load_bits(path: str) -> np.ndarray:
     if p.suffix.lower() == ".npy":
         b = np.load(p)
         b = np.asarray(b).astype(np.uint8).ravel()
+    elif p.suffix.lower() == ".mat":
+        b = load_mat_var(p, ("bits", "Bits", "b"))
+        b = np.asarray(b).astype(np.uint8).ravel()
     else:
         b = np.fromfile(p, dtype=np.uint8).ravel()
     if b.size == 0:
         raise ValueError("Empty bits file")
     return (b & 1).astype(np.uint8)
+
+
+def load_mat_var(path: Path, names, var: Optional[str] = None) -> np.ndarray:
+    import scipy.io as scio
+
+    m = scio.loadmat(path)
+    if var is None:
+        for name in names:
+            if name in m:
+                var = name
+                break
+    if var not in m:
+        raise ValueError(f"MAT variable not found. Keys={list(m.keys())}")
+    return np.asarray(m[var]).squeeze()
 
 
 def load_iq(path: str, var: Optional[str] = None) -> np.ndarray:
@@ -37,16 +54,7 @@ def load_iq(path: str, var: Optional[str] = None) -> np.ndarray:
         raise ValueError("Unsupported npy IQ format (expected complex array or Nx2 I/Q)")
 
     if suf == ".mat":
-        import scipy.io as scio
-        m = scio.loadmat(p)
-        if var is None:
-            for k in ("data", "iq", "IQ", "x"):
-                if k in m:
-                    var = k
-                    break
-        if var not in m:
-            raise ValueError(f"MAT variable not found. Keys={list(m.keys())}")
-        x = np.asarray(m[var]).squeeze()
+        x = load_mat_var(p, ("data", "iq", "IQ", "x"), var=var)
         if np.iscomplexobj(x):
             return x.astype(np.complex64).ravel()
         if x.ndim == 2 and x.shape[1] == 2:
@@ -213,8 +221,9 @@ def plot_ber_curve(rows, title: str, ymin: float) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--iq", required=True, help="IQ: .npy/.mat/.bin(float32 interleaved I,Q)")
-    ap.add_argument("--bits", required=True, help="Bits: .bin uint8 (0/1) or .npy")
+    ap.add_argument("--case", default="", help="MAT file containing both 'iq' and 'bits' variables")
+    ap.add_argument("--iq", default="", help="IQ: .npy/.mat/.bin(float32 interleaved I,Q)")
+    ap.add_argument("--bits", default="", help="Bits: .bin uint8 (0/1), .npy, or .mat containing 'bits'")
     ap.add_argument("--mod", required=True, choices=["BPSK", "QPSK", "8PSK", "16QAM", "64QAM", "256QAM"])
     ap.add_argument("--ebn0_start", type=float, default=-5.0)
     ap.add_argument("--ebn0_stop", type=float, default=20.0)
@@ -230,6 +239,7 @@ def main():
     ap.add_argument("--plot_ymin", type=float, default=1e-5, help="minimum BER shown on the log plot")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mat_var", default=None)
+    ap.add_argument("--bits_var", default=None)
     args = ap.parse_args()
 
     if args.runs < 1:
@@ -239,8 +249,19 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
-    bits = load_bits(args.bits)
-    sym = norm_to_unit_avg_power(load_iq(args.iq, var=args.mat_var))
+    if args.case:
+        if args.iq or args.bits:
+            raise ValueError("Use either --case, or --iq with --bits, not both.")
+        bits = load_mat_var(Path(args.case), ("bits", "Bits", "b"), var=args.bits_var)
+        bits = (np.asarray(bits).astype(np.uint8).ravel() & 1).astype(np.uint8)
+        if bits.size == 0:
+            raise ValueError("Empty bits variable in MAT case file")
+        sym = norm_to_unit_avg_power(load_iq(args.case, var=args.mat_var))
+    else:
+        if not args.iq or not args.bits:
+            raise ValueError("Provide either --case case.mat, or both --iq and --bits.")
+        bits = load_bits(args.bits)
+        sym = norm_to_unit_avg_power(load_iq(args.iq, var=args.mat_var))
 
     mod = args.mod.upper()
     if mod == "BPSK":

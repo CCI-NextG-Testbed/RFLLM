@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 import argparse
+import os
 from pathlib import Path
 import re
 from typing import Optional
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+STYLE_BY_FAMILY = {
+    "bpsk": {"color": "#1f77b4", "marker": "o"},
+    "qpsk": {"color": "#ff7f0e", "marker": "*"},
+    "8psk": {"color": "#2ca02c", "marker": "D"},
+    "16psk": {"gt_color": "#7DD3FC", "pred_color": "#0284C7", "marker": "s"},
+    "32psk": {"gt_color": "#F0ABFC", "pred_color": "#C026D3", "marker": "s"},
+    "4qam": {"gt_color": "#93C5FD", "pred_color": "#2563EB", "marker": "x"},
+    "16qam": {"color": "#d62728", "marker": "d"},
+    "64qam": {"gt_color": "#BBF7D0", "pred_color": "#22C55E", "marker": "*"},
+}
 
 
 def load_one_csv(path: str, snr_col: str, ber_col: str) -> pd.DataFrame:
@@ -29,14 +44,52 @@ def aggregate_df(df: pd.DataFrame, how: str) -> pd.DataFrame:
 
 
 def infer_line_style(label: str, path: str) -> str:
-    series_name = f"{label} {Path(path).stem}".lower()
-    if any(token in series_name for token in ("pred", "prediction", "predicted")):
-        return ":"
+    role = infer_source_role(label, path)
+    if role == "pred":
+        return "None"
     return "-"
 
 
 def infer_marker(label: str, path: str) -> Optional[str]:
-    return None
+    role = infer_source_role(label, path)
+    if role == "pred":
+        return "x"
+    if role == "gt":
+        return "s"
+
+    family = infer_modulation_family(label, path)
+    return STYLE_BY_FAMILY.get(family, {}).get("marker", "o")
+
+
+def infer_marker_size(label: str, path: str) -> float:
+    role = infer_source_role(label, path)
+    if role == "gt":
+        return 6.0
+    if role == "pred":
+        return 4.5
+    return 5.0
+
+
+def infer_source_role(label: str, path: str) -> str:
+    series_name = f"{label} {Path(path).stem} {Path(path).parent}".lower()
+    if any(token in series_name for token in ("pred", "prediction", "predicted")):
+        return "pred"
+    if any(token in series_name for token in ("gt", "ground_truth", "ground-truth", "ground truth")):
+        return "gt"
+    return ""
+
+
+def infer_color(label: str, path: str, fallback_color: str) -> str:
+    role = infer_source_role(label, path)
+    family = infer_modulation_family(label, path)
+    style = STYLE_BY_FAMILY.get(family, {})
+    if "color" in style:
+        return style["color"]
+    if role == "pred":
+        return style.get("pred_color", fallback_color)
+    if role == "gt":
+        return style.get("gt_color", fallback_color)
+    return style.get("pred_color", fallback_color)
 
 
 def infer_modulation_family(label: str, path: str) -> str:
@@ -124,9 +177,8 @@ def main():
 
     xmins = []
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
-    colors_by_family = {}
 
-    for path, label in zip(csv_paths, labels):
+    for idx, (path, label) in enumerate(zip(csv_paths, labels)):
         df = load_one_csv(path, args.snr_col, args.ber_col)
 
         # limit x-range
@@ -143,15 +195,17 @@ def main():
             continue
 
         xmins.append(float(df_plot["snr_db"].min()))
-        family = infer_modulation_family(label, path)
-        if family not in colors_by_family:
-            colors_by_family[family] = color_cycle[len(colors_by_family) % len(color_cycle)]
+        fallback_color = color_cycle[idx % len(color_cycle)]
 
         plt.semilogy(
             df_plot["snr_db"],
             df_plot["ber"],
-            color=colors_by_family[family],
+            color=infer_color(label, path, fallback_color),
             marker=infer_marker(label, path),
+            markersize=infer_marker_size(label, path),
+            markerfacecolor="none",
+            markeredgewidth=1.0,
+            linewidth=1.4,
             linestyle=infer_line_style(label, path),
             label=label,
         )
