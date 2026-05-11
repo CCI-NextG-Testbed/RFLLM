@@ -215,6 +215,18 @@ def semantic_similarity(text_a: str, text_b: str, model) -> float:
     return float(np.dot(emb[0], emb[1]))
 
 
+def load_prompt_lines(path: str):
+    if not path:
+        return []
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        prompts = [line.strip() for line in f if line.strip()]
+    if not prompts:
+        raise ValueError(f"Prompt file is empty: {path}")
+    return prompts
+
+
 def _signal_params_dict(args, params, modulation_hint: str = "") -> dict:
     return {
         "modulation": modulation_hint or "",
@@ -609,27 +621,33 @@ def run_batch(args):
     # Build either a semantic ladder or a balanced mixed schedule.
     semantic_mode = bool(args.semantic_base_prompt)
     if semantic_mode:
-        n = int(args.semantic_steps)
-        style_schedule = ["semantic" for _ in range(n)]
-        mod_schedule = [str(args.semantic_modulation).upper() for _ in range(n)]
         base_signal_params = _signal_params_dict(args, params, modulation_hint=str(args.semantic_modulation).upper())
-        rag_ctx = ""
-        if rag is not None and rag_build_context is not None:
-            try:
-                q = build_rag_query(style="advanced", modulation_hint=str(args.semantic_modulation).upper(), signal_params=base_signal_params)
-                rag_results = rag.search(q, top_k=int(args.rag_top_k))
-                rag_ctx = rag_build_context(rag_results, max_chars=int(args.rag_max_chars))
-            except Exception:
-                rag_ctx = ""
-        prompt_schedule = generate_semantic_prompt_ladder(
-            base_prompt=args.semantic_base_prompt,
-            llm=llm,
-            rag_context=rag_ctx,
-            modulation_hint=str(args.semantic_modulation).upper(),
-            signal_params=base_signal_params,
-            steps=n,
-            sim_model=sim_model,
-        )
+        if args.semantic_prompts_file:
+            prompt_schedule = load_prompt_lines(args.semantic_prompts_file)
+            n = len(prompt_schedule)
+            style_schedule = ["semantic_custom" for _ in range(n)]
+            mod_schedule = [str(args.semantic_modulation).upper() for _ in range(n)]
+        else:
+            n = int(args.semantic_steps)
+            style_schedule = ["semantic" for _ in range(n)]
+            mod_schedule = [str(args.semantic_modulation).upper() for _ in range(n)]
+            rag_ctx = ""
+            if rag is not None and rag_build_context is not None:
+                try:
+                    q = build_rag_query(style="advanced", modulation_hint=str(args.semantic_modulation).upper(), signal_params=base_signal_params)
+                    rag_results = rag.search(q, top_k=int(args.rag_top_k))
+                    rag_ctx = rag_build_context(rag_results, max_chars=int(args.rag_max_chars))
+                except Exception:
+                    rag_ctx = ""
+            prompt_schedule = generate_semantic_prompt_ladder(
+                base_prompt=args.semantic_base_prompt,
+                llm=llm,
+                rag_context=rag_ctx,
+                modulation_hint=str(args.semantic_modulation).upper(),
+                signal_params=base_signal_params,
+                steps=n,
+                sim_model=sim_model,
+            )
         shared_bits = rng.integers(0, 2, size=int(args.bits_len), dtype=np.uint8)
     else:
         n = int(args.batch_tests)
@@ -754,11 +772,11 @@ def run_batch(args):
         )
         if not np.isnan(cosine_similarity_score):
             print(
-                f"[{i+1}/{args.batch_tests}] cosine_similarity_score="
+                f"[{i+1}/{n}] cosine_similarity_score="
                 f"{cosine_similarity_score:.4f} saved {out_file}"
             )
         else:
-            print(f"[{i+1}/{args.batch_tests}] saved {out_file}")
+            print(f"[{i+1}/{n}] saved {out_file}")
 
     csv_path = os.path.join(out_dir, args.batch_csv)
     with open(csv_path, "w", newline="") as f:
@@ -842,6 +860,7 @@ if __name__ == "__main__":
     parser.add_argument("--plot", action="store_true", help="Save constellation plot PNG per generated batch sample.")
     parser.add_argument("--plot_stride", type=int, default=1, help="Subsample factor for constellation plotting (e.g., 2 keeps every 2nd point).")
     parser.add_argument("--semantic_base_prompt", type=str, default="", help="If set, run a semantic-similarity ladder around this base prompt.")
+    parser.add_argument("--semantic_prompts_file", type=str, default="", help="Optional text file with one custom semantic prompt per non-empty line.")
     parser.add_argument("--semantic_steps", type=int, default=10, help="Number of prompts in semantic ladder mode.")
     parser.add_argument("--semantic_modulation", type=str, default="16QAM", help="Fixed modulation used in semantic ladder mode.")
     main(parser.parse_args())
