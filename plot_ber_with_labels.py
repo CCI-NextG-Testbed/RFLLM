@@ -22,6 +22,34 @@ STYLE_BY_FAMILY = {
     "16qam": {"color": "#d62728", "marker": "d"},
     "64qam": {"gt_color": "#BBF7D0", "pred_color": "#22C55E", "marker": "*"},
 }
+MARKER_CYCLE = ["o", "D", "^", "s", "v", "P", "X", "*", "<", ">"]
+
+
+def configure_matplotlib() -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 12,
+            "axes.titlesize": 13,
+            "axes.labelsize": 13,
+            "legend.fontsize": 11,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "lines.linewidth": 1.8,
+            "lines.markersize": 7.0,
+            "axes.linewidth": 0.8,
+            "grid.linewidth": 0.5,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+
+
+def save_publication_figure(output_path: str) -> None:
+    path = Path(output_path)
+    plt.savefig(path, dpi=600, bbox_inches="tight")
+    if path.suffix.lower() != ".pdf":
+        plt.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
 
 
 def load_one_csv(path: str, snr_col: str, ber_col: str) -> pd.DataFrame:
@@ -50,12 +78,15 @@ def infer_line_style(label: str, path: str) -> str:
     return "-"
 
 
-def infer_marker(label: str, path: str) -> Optional[str]:
+def infer_marker(label: str, path: str, marker_index: int | None = None) -> Optional[str]:
     role = infer_source_role(label, path)
     if role == "pred":
         return "x"
     if role == "gt":
         return "s"
+
+    if marker_index is not None:
+        return MARKER_CYCLE[marker_index % len(MARKER_CYCLE)]
 
     family = infer_modulation_family(label, path)
     return STYLE_BY_FAMILY.get(family, {}).get("marker", "o")
@@ -64,10 +95,10 @@ def infer_marker(label: str, path: str) -> Optional[str]:
 def infer_marker_size(label: str, path: str) -> float:
     role = infer_source_role(label, path)
     if role == "gt":
-        return 6.0
+        return 7.0
     if role == "pred":
-        return 4.5
-    return 5.0
+        return 7.0
+    return 7.0
 
 
 def infer_source_role(label: str, path: str) -> str:
@@ -119,6 +150,7 @@ def infer_modulation_family(label: str, path: str) -> str:
 
 
 def main():
+    configure_matplotlib()
     ap = argparse.ArgumentParser(
         description="Plot BER vs SNR for multiple CSV files on the same semilog-y graph."
     )
@@ -173,10 +205,12 @@ def main():
     if not labels:
         labels = [Path(p).stem for p in csv_paths]
 
-    plt.figure()
+    fig, ax = plt.subplots(1, 1, figsize=(5.3, 3.8), constrained_layout=True)
 
     xmins = []
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors_by_family = {}
+    marker_counts_by_family = {}
 
     for idx, (path, label) in enumerate(zip(csv_paths, labels)):
         df = load_one_csv(path, args.snr_col, args.ber_col)
@@ -195,17 +229,22 @@ def main():
             continue
 
         xmins.append(float(df_plot["snr_db"].min()))
-        fallback_color = color_cycle[idx % len(color_cycle)]
+        family = infer_modulation_family(label, path)
+        if family not in colors_by_family:
+            colors_by_family[family] = color_cycle[len(colors_by_family) % len(color_cycle)]
+        marker_index = marker_counts_by_family.get(family, 0)
+        marker_counts_by_family[family] = marker_index + 1
+        fallback_color = colors_by_family[family]
 
-        plt.semilogy(
+        ax.semilogy(
             df_plot["snr_db"],
             df_plot["ber"],
             color=infer_color(label, path, fallback_color),
-            marker=infer_marker(label, path),
+            marker=infer_marker(label, path, marker_index),
             markersize=infer_marker_size(label, path),
             markerfacecolor="none",
-            markeredgewidth=1.0,
-            linewidth=1.4,
+            markeredgewidth=1.4,
+            linewidth=1.8,
             linestyle=infer_line_style(label, path),
             label=label,
         )
@@ -213,16 +252,15 @@ def main():
     if not xmins:
         raise SystemExit("No data to plot (all files empty after parsing/filtering).")
 
-    plt.xlabel("SNR (dB)")
-    plt.ylabel("BER")
-    plt.xlim(min(xmins), args.xmax)
-    plt.ylim(args.ymin, args.ymax)
-    plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    plt.title("BER vs SNR Comparison")
-    plt.legend()
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("BER")
+    ax.set_xlim(min(xmins), args.xmax)
+    ax.set_ylim(args.ymin, args.ymax)
+    ax.grid(True, which="both", linestyle="--", alpha=0.5)
+    ax.legend(loc="lower left", frameon=True, borderpad=0.45, handlelength=1.8)
 
     if args.out:
-        plt.savefig(args.out, dpi=200, bbox_inches="tight")
+        save_publication_figure(args.out)
     else:
         plt.show()
 
