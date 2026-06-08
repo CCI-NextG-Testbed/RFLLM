@@ -12,13 +12,12 @@ import pandas as pd
 
 
 DEFAULT_RUNS = [
-    "WavePrompt=results/New_Model/convergence_new.csv",
-    "w/o RAG=results/No_RAG/convergence.csv",
-    "w/o Loss=results/RF_Diffusion_Loss/convergence.csv",
-    "w/o Cosine Attention=results/No_Cosine_Attention/convergence.csv",
+    "New Model=results/New_Model/convergence_new.csv",
+    "No RAG=results/No_RAG/convergence.csv",
+    "RF Diffusion Loss=results/RF_Diffusion_Loss/convergence.csv",
+    "No Cosine Attention=results/No_Cosine_Attention/convergence.csv",
 ]
 DEFAULT_OUTPUT = Path("results/ablation_study_metrics.png")
-DEFAULT_LOG_YMIN = 1e-3
 PREFERRED_MODULATION_ORDER = ["BPSK", "QPSK", "8PSK", "16QAM"]
 MODULATION_COLORS = {
     "BPSK": "#1f77b4",
@@ -26,30 +25,6 @@ MODULATION_COLORS = {
     "8PSK": "#2ca02c",
     "16QAM": "#d62728",
 }
-
-
-def configure_matplotlib() -> None:
-    plt.rcParams.update(
-        {
-            "font.family": "DejaVu Sans",
-            "font.size": 15,
-            "axes.titlesize": 16,
-            "axes.labelsize": 16,
-            "legend.fontsize": 14,
-            "xtick.labelsize": 13,
-            "ytick.labelsize": 14,
-            "axes.linewidth": 0.8,
-            "grid.linewidth": 0.5,
-            "pdf.fonttype": 42,
-            "ps.fonttype": 42,
-        }
-    )
-
-
-def save_publication_figure(fig, output_path: Path) -> None:
-    fig.savefig(output_path, dpi=600, bbox_inches="tight")
-    if output_path.suffix.lower() != ".pdf":
-        fig.savefig(output_path.with_suffix(".pdf"), bbox_inches="tight")
 
 
 def parse_run(value: str) -> tuple[str, Path]:
@@ -152,36 +127,7 @@ def modulation_color(column: str, fallback_color: str) -> str:
     return MODULATION_COLORS.get(modulation, fallback_color)
 
 
-def apply_y_scale(
-    ax,
-    metrics: pd.DataFrame,
-    evm_cols: list[str],
-    y_scale: str,
-    log_ymin: float,
-) -> None:
-    if y_scale != "log":
-        ax.margins(y=0.18)
-        ax.grid(axis="y", alpha=0.3)
-        return
-
-    positive_lows = []
-    positive_highs = []
-    for column in evm_cols:
-        positive_lows.extend(metrics[f"{column}_min"][metrics[f"{column}_min"] > 0].tolist())
-        positive_highs.extend(metrics[f"{column}_max"][metrics[f"{column}_max"] > 0].tolist())
-
-    ax.set_yscale("log", base=10)
-    if positive_lows and positive_highs:
-        ax.set_ylim(min(log_ymin, min(positive_lows) / 1.8), max(positive_highs) * 1.8)
-    ax.grid(axis="y", which="both", alpha=0.3)
-
-
-def plot_grouped(
-    metrics: pd.DataFrame,
-    output_path: Path,
-    y_scale: str,
-    log_ymin: float,
-) -> None:
+def plot_grouped(metrics: pd.DataFrame, output_path: Path) -> None:
     labels = metrics["label"].tolist()
     x = np.arange(len(labels))
     evm_cols = sorted_evm_cols(metrics)
@@ -197,7 +143,7 @@ def plot_grouped(
         for idx, col in enumerate(evm_cols)
     ]
 
-    fig, ax = plt.subplots(figsize=(6.9, 3.9), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(13, 6.5))
     offsets = np.linspace(
         -group_width / 2 + width / 2,
         group_width / 2 - width / 2,
@@ -217,13 +163,15 @@ def plot_grouped(
             capsize=4,
             error_kw={"ecolor": "black", "elinewidth": 1.1, "capthick": 1.1},
         )
+        add_value_labels(ax, bars, values, upper_errors, y_offset=4 + (idx % 2) * 9)
 
     ax.set_xlabel("Ablation Setting")
-    ax.set_ylabel("EVM")
+    ax.set_ylabel("Metric Value")
+    ax.set_title("Ablation Study Metrics (Mean with Min/Max Range)")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.margins(x=0.08)
-    apply_y_scale(ax, metrics, evm_cols, y_scale, log_ymin)
+    ax.margins(x=0.08, y=0.18)
+    ax.grid(axis="y", alpha=0.3)
     ax.legend(
         ncols=1,
         loc="upper right",
@@ -232,15 +180,11 @@ def plot_grouped(
         framealpha=0.9,
         edgecolor="0.85",
     )
-    save_publication_figure(fig, output_path)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
 
 
-def plot_panels(
-    metrics: pd.DataFrame,
-    output_path: Path,
-    y_scale: str,
-    log_ymin: float,
-) -> None:
+def plot_panels(metrics: pd.DataFrame, output_path: Path) -> None:
     labels = metrics["label"].tolist()
     x = np.arange(len(labels))
     evm_cols = sorted_evm_cols(metrics)
@@ -254,13 +198,7 @@ def plot_panels(
         for idx, col in enumerate(evm_cols)
     ]
 
-    fig, axes = plt.subplots(
-        len(series),
-        1,
-        figsize=(6.7, 5.4),
-        sharex=True,
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(len(series), 1, figsize=(11, 9), sharex=True)
     for ax, (column, display, color) in zip(axes, series):
         values = metrics[column].tolist()
         upper_errors = metrics[f"{column}_err_high"].tolist()
@@ -273,21 +211,19 @@ def plot_panels(
             capsize=4,
             error_kw={"ecolor": "black", "elinewidth": 1.1, "capthick": 1.1},
         )
+        add_value_labels(ax, bars, values, upper_errors)
         ax.set_ylabel(display)
-        apply_y_scale(ax, metrics, evm_cols, y_scale, log_ymin)
+        ax.grid(axis="y", alpha=0.3)
 
     axes[-1].set_xlabel("Ablation Setting")
     axes[-1].set_xticks(x)
     axes[-1].set_xticklabels(labels, rotation=20, ha="right")
-    save_publication_figure(fig, output_path)
+    fig.suptitle("Ablation Study Metrics (Mean with Min/Max Range)", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
 
 
-def plot_quadrants(
-    metrics: pd.DataFrame,
-    output_path: Path,
-    y_scale: str,
-    log_ymin: float,
-) -> None:
+def plot_quadrants(metrics: pd.DataFrame, output_path: Path) -> None:
     labels = metrics["label"].tolist()
     x = np.arange(len(labels))
     evm_cols = sorted_evm_cols(metrics)
@@ -300,31 +236,35 @@ def plot_quadrants(
 
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(9.2, 6.8), sharey=False, constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8.5), sharey=False)
     for idx, (ax, column) in enumerate(zip(axes.ravel(), evm_cols)):
         modulation = column.replace("evm_", "")
         values = metrics[column].tolist()
         upper_errors = metrics[f"{column}_err_high"].tolist()
         color = modulation_color(column, color_cycle[idx % len(color_cycle)])
-        ax.bar(
+        bars = ax.bar(
             x,
             values,
             color=color,
-            width=0.68,
+            width=0.62,
             yerr=evm_range_errors(metrics, column),
             capsize=4,
             error_kw={"ecolor": "black", "elinewidth": 1.1, "capthick": 1.1},
         )
-        ax.set_ylabel(f"{modulation} EVM")
+        add_value_labels(ax, bars, values, upper_errors)
+        ax.set_title(f"{modulation} EVM", fontsize=12)
+        ax.set_ylabel("EVM")
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=20, ha="right")
-        apply_y_scale(ax, metrics, evm_cols, y_scale, log_ymin)
+        ax.margins(y=0.25)
+        ax.grid(axis="y", alpha=0.3)
 
-    save_publication_figure(fig, output_path)
+    fig.suptitle("Ablation Study EVM by Modulation (Mean with Min/Max Range)", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200, bbox_inches="tight")
 
 
 def main() -> None:
-    configure_matplotlib()
     parser = argparse.ArgumentParser(
         description="Plot ablation bars for per-modulation EVM metrics."
     )
@@ -354,18 +294,6 @@ def main() -> None:
         help="Use 2x2 modulation quadrants, stacked panels, or grouped bars.",
     )
     parser.add_argument(
-        "--y-scale",
-        choices=["log", "linear"],
-        default="log",
-        help="Y-axis scale for EVM bars. Use log to compare values on the same visual scale.",
-    )
-    parser.add_argument(
-        "--log-ymin",
-        type=float,
-        default=DEFAULT_LOG_YMIN,
-        help="Minimum y-axis value for log-scale plots.",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
@@ -375,8 +303,6 @@ def main() -> None:
 
     if args.range_window < 1:
         raise ValueError("--range-window must be at least 1.")
-    if args.log_ymin <= 0:
-        raise ValueError("--log-ymin must be greater than 0.")
 
     runs = args.run or [parse_run(run) for run in DEFAULT_RUNS]
     summaries = [
@@ -387,11 +313,11 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.layout == "quadrants":
-        plot_quadrants(metrics, args.output, args.y_scale, args.log_ymin)
+        plot_quadrants(metrics, args.output)
     elif args.layout == "grouped":
-        plot_grouped(metrics, args.output, args.y_scale, args.log_ymin)
+        plot_grouped(metrics, args.output)
     else:
-        plot_panels(metrics, args.output, args.y_scale, args.log_ymin)
+        plot_panels(metrics, args.output)
 
     print(metrics.to_string(index=False))
     print(f"Saved ablation plot to {args.output}")
