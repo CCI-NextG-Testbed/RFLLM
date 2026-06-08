@@ -630,8 +630,9 @@ class tfdiffLearner:
 
         degrade_data = self.diffusion.degrade_fn(data, t)
 
-        # model accepts prompt + symbol-conditioning sequence
-        cond = {'prompt': prompts, 'bits_cond': bits_cond}
+        # model must accept prompts as list[str] and embed them internally
+        # pass conditioning as a dict to support both prompt (text) and bits
+        cond = {'prompt': prompts, 'bits': bits}
         predicted = self.model(degrade_data, t, cond)
 
         base_loss = self._base_loss(data, predicted, sps=sps)

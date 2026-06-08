@@ -187,7 +187,7 @@ class tfdiff_Simple(nn.Module):
         self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim)
 
         # Optional conditioning projection (real -> complex hidden)
-        self.text_encoder = SentenceTransformer("intfloat/e5-large-v2")
+        self.text_encoder = SentenceTransformer("BAAI/bge-large-en-v1.5")
         text_dim = self.text_encoder.get_sentence_embedding_dimension()
         # project real text embedding to complex [B, H, 2]
         self.text_proj = nn.Linear(text_dim, self.hidden_dim * 2)

@@ -352,79 +352,69 @@ class AttnMul(torch.autograd.Function):
 class CosineAttentionCausal(nn.Module):
     def __init__(self, num_heads, eps=1e-8):
         super().__init__()
+        self.dropout_p = dropout
         self.eps = eps
-        # norm_const of shape (1, H, 1, 1) like preprint
-        self.norm_const = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
 
-    def forward(self, Q, K, V, s=None):
-        B, H, S, Dk = Q.shape
-        if s is None:
-            # match "sequence length at current timestep"
-            s = torch.tensor(float(S), device=Q.device, dtype=Q.dtype).view(1, 1, 1, 1)
+    def forward(self, queries, keys, values):
+        # Use real parts for score computation (stable baseline)
+        q_r = queries[..., 0]  # [Bh, Nq, D]
+        k_r = keys[..., 0]     # [Bh, Nk, D]
 
-        # cosine normalization
-        Qn = F.normalize(Q, dim=-1, p=2, eps=self.eps)
-        Kn = F.normalize(K, dim=-1, p=2, eps=self.eps)
+        # L2 normalize along feature dim D
+        qn = q_r / (q_r.norm(dim=-1, keepdim=True) + self.eps)
+        kn = k_r / (k_r.norm(dim=-1, keepdim=True) + self.eps)
 
-        # V scaling per head
-        # Preprint line: V = V / s ** norm_const.sigmoid()
-        scale = s ** torch.sigmoid(self.norm_const)   # [1,H,1,1] broadcast over B,S,Dv
-        Vt = V / scale
+        # scores: [Bh, Nq, Nk]
+        scores = torch.bmm(qn, kn.transpose(1, 2))
 
-        return AttnMul.apply(Qn, Kn, Vt)
+        # softmax over keys
+        attn = F.softmax(scores, dim=-1)
+
+        # dropout on attention weights (real)
+        if self.training and self.dropout_p and self.dropout_p > 0:
+            attn = F.dropout(attn, p=self.dropout_p)
+
+        # Convert to complex weights: real=attn, imag=0 so we can use complex_bmm
+        attn_c = torch.zeros(attn.shape[0], attn.shape[1], attn.shape[2], 2,
+                             device=attn.device, dtype=values.dtype)
+        attn_c[..., 0] = attn
+
+        # apply weights to complex values
+        out = complex_bmm(attn_c, values)  # [Bh, Nq, D, 2]
+        return out
 
 
 class CosineComplexMultiHeadAttention(nn.Module):
-    """
-    Complex multi-head block in correspondence with the preprint:
-      - Uses real(Q) and real(K) for cosine-normalized Q,K (stable baseline)
-      - Applies the preprint AttnMul causal operator to V_real and V_imag separately
-      - Re-stacks into complex output
-    """
-    def __init__(self, hidden_dim, num_heads, bias=True, eps=1e-8):
+    def __init__(self, hidden_dim, num_heads, dropout=0.0, bias=True, eps=1e-8):
         super().__init__()
         self.num_heads = num_heads
-        self.eps = eps
+
+        self.attn = CosineDotProductAttention(dropout=dropout, eps=eps)
 
         self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_v = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_o = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
 
-        self.attn = CosineAttentionCausal(num_heads=num_heads, eps=eps)
-
-    def forward(self, queries, keys, values, s=None):
-        """
-        queries/keys/values: [B, S, hidden_dim, 2]
-        returns:            [B, S, hidden_dim, 2]
-        """
-        # project (complex)
+    def forward(self, queries, keys, values):
+        # Project
         q = self.w_q(queries)
         k = self.w_k(keys)
         v = self.w_v(values)
 
-        # split heads
-        qh = _split_heads_complex(q, self.num_heads)  # [B,H,S,hd,2]
-        kh = _split_heads_complex(k, self.num_heads)  # [B,H,S,hd,2]
-        vh = _split_heads_complex(v, self.num_heads)  # [B,H,S,hd,2]
+        # Head split: [B,N,H,2] -> [B*heads, N, head_dim, 2]
+        q = transpose_qkv(q, self.num_heads)
+        k = transpose_qkv(k, self.num_heads)
+        v = transpose_qkv(v, self.num_heads)
 
-        # Use REAL parts for Q,K as in your current baseline
-        Qr = qh[..., 0]  # [B,H,S,hd]
-        Kr = kh[..., 0]  # [B,H,S,hd]
+        # Cosine attention per head
+        out = self.attn(q, k, v)  # [B*heads, N, head_dim, 2]
 
-        # Apply preprint attention to V_real and V_imag separately
-        Vr = vh[..., 0]  # [B,H,S,hd]
-        Vi = vh[..., 1]  # [B,H,S,hd]
-
-        Or = self.attn(Qr, Kr, Vr, s=s)  # [B,H,S,hd]
-        Oi = self.attn(Qr, Kr, Vi, s=s)  # [B,H,S,hd]
-
-        out_h = torch.stack([Or, Oi], dim=-1)  # [B,H,S,hd,2]
-
-        # merge heads + output proj
-        out = _merge_heads_complex(out_h)  # [B,S,hidden_dim,2]
+        # Merge heads: -> [B,N,H,2]
+        out = transpose_output(out, self.num_heads)
         out = self.w_o(out)
         return out
+
 
 
 class ComplexPositionalEncoding(nn.Module):

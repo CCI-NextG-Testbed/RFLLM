@@ -46,7 +46,6 @@ params_simple = AttrDict(
     mlp_ratio=4,
     learn_tfdiff=False,
     signal_diffusion=True,        # use GaussianDiffusion or set True if you prepared blur schedule
-    max_text_tokens=12,
     max_step=100,
     # variance of the guassian blur applied on the spectrogram on each diffusion step [T]
     blur_schedule=((1e-5**2) * np.ones(100)).tolist(),

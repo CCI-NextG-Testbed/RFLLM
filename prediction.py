@@ -591,11 +591,11 @@ def run_single(args):
     )
 
     with torch.no_grad():
-        cond = {"prompt": user_prompt, "bits_cond": bits_cond}
+        cond = {"prompt": prompt, "bits": bits}  # bits is np.uint8 1D vector
         pred = diffusion.sampling(model, cond, device)
 
     print(f"Saving to {out_path}")
-    save_mat(out_path, pred, user_prompt, bits)
+    save_mat(out_path, pred, prompt, bits)
 
 
 def run_batch(args):
