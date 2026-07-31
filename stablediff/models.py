@@ -98,10 +98,10 @@ class DiA(nn.Module):
         self.norm1 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
         attn_eps = float(block_kwargs.get("eps", 1e-8))
-        #self.attn = cm.CosineComplexMultiHeadAttention(
-        #    hidden_dim, num_heads, bias=True, eps=attn_eps)
-        self.attn = cm.ComplexMultiHeadAttention(
-            hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
+        self.attn = cm.CosineComplexMultiHeadAttention(
+            hidden_dim, num_heads, bias=True, eps=attn_eps)
+        #self.attn = cm.ComplexMultiHeadAttention(
+        #    hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
         self.norm2 = cm.NaiveComplexLayerNorm(
             hidden_dim, eps=1e-6, elementwise_affine=False)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
