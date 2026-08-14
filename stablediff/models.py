@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from sentence_transformers import SentenceTransformer
 
 import complex.complex_module as cm
+import complex.complex_layers as cm_l
 
 
 def init_weight_norm(module):
@@ -92,83 +93,77 @@ class PositionEmbedding(nn.Module):
         return table
 
 
-class DiA(nn.Module):
-    def __init__(self, hidden_dim, num_heads, dropout, mlp_ratio=4.0, **block_kwargs):
+class ComplexUNet(nn.Module):
+
+    def __init__(self):
         super().__init__()
-        self.norm1 = cm.NaiveComplexLayerNorm(
-            hidden_dim, eps=1e-6, elementwise_affine=False)
-        attn_eps = float(block_kwargs.get("eps", 1e-8))
-        self.attn = cm.CosineComplexMultiHeadAttention(
-            hidden_dim, num_heads, bias=True, eps=attn_eps)
-        #self.attn = cm.ComplexMultiHeadAttention(
-        #    hidden_dim, hidden_dim, num_heads, dropout, bias=True, **block_kwargs)
-        self.norm2 = cm.NaiveComplexLayerNorm(
-            hidden_dim, eps=1e-6, elementwise_affine=False)
-        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            cm.ComplexLinear(hidden_dim, mlp_hidden_dim, bias=True),
-            cm.ComplexSiLU(),
-            cm.ComplexLinear(mlp_hidden_dim, hidden_dim, bias=True),
+
+        self.encoder = nn.Module([
+            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(4, 320, kernel_size=3, padding=1)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 320),  cm.ComplexUNet_AttentionBlock(8, 40)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(320, 320, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(320, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 640),  cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(640, 640, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280),  cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm_l.ComplexConv2d(1280, 1280, kernel_size=3, stride=2, padding=1)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 1280)),
+        ])
+
+        self.bottleneck = cm.ComplexSwitchSequential(
+            cm.ComplexUNet_ResidualBlock(1280, 1280),
+            cm.ComplexUNet_ResidualBlock(8, 160),
+            cm.ComplexUNet_ResidualBlock(1280, 1280),
         )
-        self.adaLN_modulation = nn.Sequential(
-            cm.ComplexSiLU(),
-            cm.ComplexLinear(hidden_dim, 6*hidden_dim, bias=True)
-        )
-        self.apply(init_weight_xavier)
-        self.adaLN_modulation.apply(init_weight_zero)
 
-    def forward(self, x, c):
-        """
-        Embedding diffusion step t with adaptive layer-norm.
-        Embedding condition c with cross-attention.
-        - Input:\\
-          x, [B, N, H, 2], \\ 
-          c, [B, N, H, 2], \\
-        """
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(
-            c).chunk(6, dim=1)
-        mod_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + \
-            gate_msa.unsqueeze(
-                1) * self.attn(mod_x, mod_x, mod_x)
-        x = x + \
-            gate_mlp.unsqueeze(
-                1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
+        self.decoder = nn.Module([
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUpSample(1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(2560, 1280), cm.ComplexUNet_AttentionBlock(8, 160)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 1280), cm.ComplexUNet_AttentionBlock(8, 160), cm.ComplexUpSample(1280)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1920, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(1280, 640), cm.ComplexUNet_AttentionBlock(8, 80)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 640), cm.ComplexUNet_AttentionBlock(8, 80), cm.ComplexUpSample(640)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(960, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
+            cm.ComplexSwitchSequential(cm.ComplexUNet_ResidualBlock(640, 320), cm.ComplexUNet_AttentionBlock(8, 40)),
+        ])
 
-
-class FinalLayer(nn.Module):
-    def __init__(self, hidden_dim, out_dim):
-        super().__init__()
-        self.norm = cm.NaiveComplexLayerNorm(
-            hidden_dim, eps=1e-6, elementwise_affine=False)
-        self.linear = cm.ComplexLinear(hidden_dim, out_dim, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            cm.ComplexSiLU(),
-            cm.ComplexLinear(hidden_dim, 2*hidden_dim, bias=True)
-        )
-        self.apply(init_weight_zero)
-
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm(x), shift, scale)
-        x = self.linear(x)
-        return x
     
-class tfdiff_Simple(nn.Module):
-    """
-    A simpler variant of tfdiff_WiFi for generic complex-valued sequences.
+    def forward(self, x, context, time):
 
-    Expected tensor shapes:
-      x: [B, N, input_dim, 2]        (complex stored as (..., 2) = (real, imag))
-      t: [B] or [B,] int/float step  (same as your DiffusionEmbedding usage)
-      cond (optional):
-         - None: uses only diffusion embedding t
-         - tensor [B, cond_dim] real: projected into complex [B, H, 2]
-         - tensor [B, H, 2] complex: used directly as conditioning
-    Output:
-      y: [B, N, output_dim, 2]
-    """
+        skip_connections = []
+
+        for layers in self.encoder:
+            x = layers(x, context, time)
+            skip_connections.append(x)
+
+        x = self.bottleneck(x, context, time)
+
+        for layers in self.decoder:
+            x = torch.cat([x, skip_connections.pop()], dim=1)
+            x = layers(x, context, time)
+
+        return x
+
+class ComplexUNet_OutputLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.groupnorm = nn.GroupNorm(num_groups=32, num_channels=in_channels)
+        self.conv = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        x = self.groupnorm(x)
+        x = F.silu(x)
+        x = self.conv(x)
+        return x
+
+class stablediff_Simple(nn.Module):
 
     def __init__(self, params):
         super().__init__()
@@ -183,119 +178,21 @@ class tfdiff_Simple(nn.Module):
         self.mlp_ratio = params.mlp_ratio
 
         # Embeddings
-        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim)
-        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim)
+        self.p_embed = PositionEmbedding(params.sample_rate, self.input_dim, self.hidden_dim) # Position Embedding for complex space preservation
+        self.t_embed = DiffusionEmbedding(params.max_step, params.embed_dim, self.hidden_dim) # Time Embedding
 
-        # Optional conditioning projection (real -> complex hidden)
-        self.text_encoder = SentenceTransformer("BAAI/bge-large-en-v1.5")
-        text_dim = self.text_encoder.get_sentence_embedding_dimension()
-        # project real text embedding to complex [B, H, 2]
-        self.text_proj = nn.Linear(text_dim, self.hidden_dim * 2)
         init_weight_xavier(self.text_proj)
 
         self.bits_token = nn.Linear(1, self.hidden_dim * 2)
         init_weight_xavier(self.bits_token)
 
-        # Blocks + head
-        self.blocks = nn.ModuleList(
-            [DiA(self.hidden_dim, self.num_heads, self.dropout, self.mlp_ratio) for _ in range(params.num_block)]
-        )
-        self.final_layer = FinalLayer(self.hidden_dim, self.output_dim)
+        self.unet = ComplexUNet()
+        self.final = ComplexUNet_OutputLayer(320, 4)
 
-    def _encode_text(self, prompts, device):
-        """
-        prompts: list[str] or already a tensor
-        Returns: complex conditioning vector [B, H, 2]
-        """
-        if isinstance(prompts, (list, tuple)):
-            # SentenceTransformer handles batching internally
-            text_emb = self.text_encoder.encode(
-                prompts,
-                convert_to_tensor=True,
-                device=device,
-                show_progress_bar=False,
-            )   # [B, D_text], real
-        elif isinstance(prompts, torch.Tensor):
-            # assume already [B, D_text] real embeddings
-            text_emb = prompts.to(device)
-        else:
-            # single string
-            text_emb = self.text_encoder.encode(
-                [prompts],
-                convert_to_tensor=True,
-                device=device,
-                show_progress_bar=False,
-            )   # [1, D_text]
+    def forward(self, latent, context, time):
+        time = self.t_embed(time)
 
-        B = text_emb.shape[0]
-        # project to 2*hidden_dim and reshape to complex [B, H, 2]
-        text_proj = self.text_proj(text_emb)              # [B, 2H]
-        text_proj = text_proj.view(B, self.hidden_dim, 2) # [B, H, 2]
-        return text_proj
-    
-    def _encode_bits_seq(self, bits, device, N):
-        """
-        bits: [B,N] 0/1 (or [B,N,1])
-        return: [B,N,H,2]
-        """
-        if bits is None:
-            return None
-        if not isinstance(bits, torch.Tensor):
-            bits = torch.tensor(bits, dtype=torch.float32, device=device)
-        else:
-            bits = bits.to(device).float()
+        output = self.unet(latent, context, time)
+        output = self.final(output)
 
-        if bits.ndim == 1:
-            bits = bits.unsqueeze(0)  # [1,N]
-        if bits.shape[1] != N:
-            # If mismatch, you need a mapping from samples->symbols (oversampling etc.)
-            # For now, truncate/pad as a safe fallback:
-            if bits.shape[1] > N:
-                bits = bits[:, :N]
-            else:
-                pad = torch.zeros(bits.shape[0], N - bits.shape[1], device=device)
-                bits = torch.cat([bits, pad], dim=1)
-
-        bits = bits.unsqueeze(-1)  # [B,N,1]
-        B = bits.shape[0]
-        b = self.bits_token(bits)              # [B,N,2H]
-        b = b.view(B, N, self.hidden_dim, 2)   # [B,N,H,2]
-        return b
-
-    def forward(self, x, t, cond):
-        device = x.device
-
-        # cond is dict: {'prompt': label/list[str], 'bits_cond' or 'bits': [B,N]}
-        prompt_input = cond.get("prompt") if isinstance(cond, dict) else cond
-        bits_input   = None
-        if isinstance(cond, dict):
-            bits_input = cond.get("bits_cond", cond.get("bits"))
-
-        # x expected [B,N,1,2]
-        B, N = x.shape[0], x.shape[1]
-
-        # tokenize signal
-        x = self.p_embed(x)        # [B,N,H,2]
-
-        # timestep embedding
-        t = self.t_embed(t)        # [B,H,2]
-
-        # prompt is global "c" like your reference
-        c_prompt = self._encode_text(prompt_input, device)  # [B,H,2]
-        if c_prompt is None:
-            c = t
-        else:
-            if c_prompt.shape[0] == 1 and B > 1:
-                c_prompt = c_prompt.expand(B, -1, -1)
-            c = t + c_prompt       # [B,H,2]
-
-        # bits are per-token injection (unambiguous)
-        b_seq = self._encode_bits_seq(bits_input, device, N)  # [B,N,H,2] or None
-        if b_seq is not None:
-            x = x + b_seq
-
-        for block in self.blocks:
-            x = block(x, c)
-
-        x = self.final_layer(x, c)
-        return x
+        return output

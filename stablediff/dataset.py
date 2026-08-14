@@ -202,11 +202,10 @@ class Collator:
             elif L > N:
                 x_c = x_c[:N]
 
-            # [N] complex -> [N,1] -> [N,1,2] float
-            x_c = x_c.view(N, 1)
-            x_ri = torch.view_as_real(x_c).to(torch.float32)  # [N,1,2]
+            x_c = x_c.view(1, N, 1)
+            # [1, N, 1] complex64
 
-            data_list.append(x_ri)
+            data_list.append(x_c)
 
             # ---------- prompt ----------
             prompt_list.append(str(record["label"]))
@@ -236,7 +235,7 @@ class Collator:
 
             bits_list.append(torch.from_numpy(b_t))  # [N]
 
-        data = torch.stack(data_list, dim=0)         # [B,N,1,2]
+        data = torch.stack(data_list, dim=0)         # [B,1,N,1]
         bits = torch.stack(bits_list, dim=0)         # [B,N]
 
         return {

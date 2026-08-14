@@ -11,7 +11,7 @@ Based on https://openreview.net/forum?id=H1T2hmZAb
 
 import torch
 from torch.nn import Module, Parameter, init
-from torch.nn import Conv2d, Conv3d, Linear, BatchNorm1d, BatchNorm2d, BatchNorm3d, LayerNorm
+from torch.nn import Conv2d, Conv3d, Linear, BatchNorm1d, BatchNorm2d, BatchNorm3d, LayerNorm, GroupNorm
 from torch.nn import ConvTranspose2d
 from .complex_functions import complex_relu, complex_max_pool2d, complex_avg_pool2d, complex_max_pool3d
 from .complex_functions import complex_dropout, complex_dropout2d, complex_dropout3d
@@ -172,6 +172,22 @@ class ComplexLinear(Module):
     def forward(self, input):
         return apply_complex(self.fc_r, self.fc_i, input)
 
+class ComplexGroupNorm(Module):
+    def __init__(self, num_groups, num_channels, eps=1e-5, affine=True):
+        super().__init__()
+
+        self.norm_r = GroupNorm(
+            num_groups, num_channels, eps=eps, affine=affine
+        )
+        self.norm_i = GroupNorm(
+            num_groups, num_channels, eps=eps, affine=affine
+        )
+
+    def forward(self, x):
+        real = self.norm_r(x.real)
+        imag = self.norm_i(x.imag)
+
+        return real.type(torch.complex64) + 1j * imag.type(torch.complex64)
 
 class NaiveComplexBatchNorm1d(Module):
     '''
@@ -531,3 +547,4 @@ class ComplexBNGRUCell(Module):
         h_new = (1 + complex_opposite(z)) * n + z * h # element-wise multiplication
 
         return h_new
+

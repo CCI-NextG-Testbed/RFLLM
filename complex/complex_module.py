@@ -4,6 +4,8 @@ from torch.nn import functional as F
 
 import numpy as np
 import math
+import complex.complex_layers as cm_l
+import complex.complex_functions as cm_f
 
 
 def apply_complex(F_r, F_i, X):
@@ -111,6 +113,16 @@ class ComplexReLU(nn.Module):
     def forward(self, X):
         return apply_complex_sep(self.relu_r, self.relu_i, X)
 
+class NativeComplexReLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return torch.complex(
+            self.relu(x.real),
+            self.relu(x.imag)
+        )
 
 class ComplexAvgPool3d(nn.Module):
     def __init__(self, kernel_size, stride, padding):
@@ -218,7 +230,6 @@ class ComplexConv3d(nn.Module):
 
     def forward(self, X):
         return apply_complex(self.conv_r, self.conv_i, X)
-
 
 class ComplexResidual3d(nn.Module):
     def __init__(self, input_channels, num_channels, kernel_size, padding, stride=1):
@@ -389,7 +400,7 @@ class CosineComplexMultiHeadAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-        self.attn = CosineDotProductAttention(dropout=dropout, eps=eps)
+        self.attn = ComplexDotProductAttention(dropout=dropout, eps=eps)
 
         self.w_q = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
         self.w_k = ComplexLinear(hidden_dim, hidden_dim, bias=bias)
@@ -414,7 +425,6 @@ class CosineComplexMultiHeadAttention(nn.Module):
         out = transpose_output(out, self.num_heads)
         out = self.w_o(out)
         return out
-
 
 
 class ComplexPositionalEncoding(nn.Module):
@@ -531,3 +541,112 @@ class ComplexTransformerEncoder(nn.Module):
             X = blk(X)
             self.attention_weights[i] = blk.attention.attention.attention_weights
         return X
+
+class ComplexUpSample(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return cm_f.complex_upsample(x, scale_factor=2)
+
+class ComplexUNet_ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, t):
+        super().__init__()
+        self.groupnorm_feature = cm_l.ComplexGroupNorm(32, in_channels)
+        self.conv_features = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.linear_time = ComplexLinear(t, out_channels)
+
+        self.groupnorm_merged = cm_l.ComplexGroupNorm(32, out_channels)
+        self.conv_merged = cm_l.ComplexConv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+        if in_channels == out_channels:
+            self.residual_layer = nn.Identity()
+        else:
+            self.residual_layer = cm_l.ComplexConv2d(in_channels, out_channels, kernel_size=1, padding=0)
+
+    def forward(self, feature, t):
+        residue = feature
+
+        feature = self.groupnorm_feature(feature)
+        feature = cm_f.complex_silu(feature)
+        feature = self.conv_features(feature)
+
+        t = F.silu(t)
+        t = self.linear_time(t)
+
+        merged = feature + t.unsqueeze(-1).unsqueeze(-1)
+        merged = self.groupnorm_merged(merged)
+        merged = cm_f.complex_silu(merged)
+        merged = self.conv_merged(merged)
+
+        return merged + self.residual_layer(residue)
+
+class ComplexUNet_AttentionBlock(nn.Module):
+    def __init__(self, n_head, n_embd, d_context):
+        super().__init__()
+        channels = n_head + n_embd
+
+        self.groupnorm = cm_l.ComplexGroupNorm(32, channels, eps=1e-6)
+        self.conv_input = cm_l.ComplexConv2d(channels, channels, kernel_size=1, padding=0)
+
+        self.layernorm_1 = cm_l.NaiveComplexLayerNorm(channels)
+        self.attention_1 = CosineComplexMultiHeadAttention(
+            n_head, channels, bias=True, eps=1e8) 
+
+        self.layernorm_2 = cm_l.NaiveComplexLayerNorm(channels)
+        #self.attention_2 = CosineComplexMultiHeadAttention(
+        #    n_head, channels, d_context, bias=True, eps=attn_eps) -> Needs to be Cross Attention
+        self.layernorm_3 = cm_l.NaiveComplexLayerNorm(channels)
+        self.linear_geglu_1 = cm_l.ComplexLinear(channels * 4, channels * 2)
+        self.linear_geglu_2 = cm_l.ComplexLinear(channels * 4, channels)
+
+        self.conv_output = cm_l.ComplexConv2d(channels, channels, kernel_size=1, padding=0)
+
+    def forward(self, x, context):
+
+        residue_long = x
+
+        x = self.groupnorm(x)
+        x = self.conv_input(x)
+
+        n, c, h, w = x.shape
+        x = x.view((n, c, h * w)).transpose(-1, -2)  # [N, H*W, C]
+
+        residue_short = x
+
+        x = self.layernorm_1(x)
+        x = self.attention_1(x)
+
+        x += residue_short
+
+        residue_short = x
+
+        x = self.layernorm_2(x)
+        x = self.attention_2(x, context)
+
+        x += residue_short
+
+        residue_short = x
+
+        x = self.layernorm_3(x)
+        x, gate = self.linear_geglu_1(x).chunk(2, dim=-1)
+
+        x = x * cm_f.complex_gelu(gate)
+        x = self.linear_geglu_2(x)
+
+        x += residue_short
+
+        x = x.transpose(-1, -2).view((n, c, h, w))
+
+        return self.conv_output(x) + residue_long
+
+class ComplexSwitchSequential(nn.Module):
+    def forward(self, x, context, t):
+        for layer in self:
+            if isinstance(layer, ComplexUNet_AttentionBlock):
+                x = layer(x, context)
+            elif isinstance(layer, ComplexUNet_ResidualBlock):
+                x = layer(x, t)
+            else:
+                x = layer(x)
+        return x

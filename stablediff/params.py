@@ -19,6 +19,7 @@ class AttrDict(dict):
 params_simple = AttrDict(
     log_dir='./log/simple',
     model_dir='./model/simple',
+    cvae_model_dir='./cvae_model',
     out_dir='./dataset/simple/output/prediction.mat',
     data_dir=['./dataset/simple/raw'],  # list of folders
     max_iter=None,

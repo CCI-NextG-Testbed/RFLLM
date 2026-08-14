@@ -200,3 +200,15 @@ def complex_dropout3d(input, p=0.5, training=True):
     mask = dropout3d(mask, p, training)*1/(1-p)
     mask.type(input.dtype)
     return mask*input
+
+def complex_silu(input):
+    return (
+        torch.nn.functional.silu(input.real).type(torch.complex64)
+        + 1j * torch.nn.functional.silu(input.imag).type(torch.complex64)
+    )
+
+def complex_gelu(input):
+    return (
+        torch.nn.functional.gelu(input.real).type(torch.complex64)
+        + 1j * torch.nn.functional.gelu(input.imag).type(torch.complex64)
+    )
